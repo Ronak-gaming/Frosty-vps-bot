@@ -200,4 +200,3 @@ class ReinstallConfirmView(discord.ui.View):
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, _button):
         await interaction.response.edit_message(embed=self.parent.embed(), view=self.parent)
-
