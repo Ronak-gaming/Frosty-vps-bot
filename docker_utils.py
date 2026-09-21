@@ -8,7 +8,7 @@ import time
 import discord
 
 import config
-from config import DOCKER_IMAGE, CPU_THRESHOLD, CPU_CHECK_INTERVAL
+from config import DOCKER_IMAGE, CPU_THRESHOLD, CPU_CHECK_INTERVAL, logger
 import storage
 from storage import vps_data, save_data
 
@@ -130,9 +130,10 @@ def get_host_cpu_percent() -> float:
         for line in out.splitlines():
             if "%Cpu(s):" in line:
                 for part in line.split(","):
-                    if "id," in part or part.strip().endswith("id"):
-                        idle = float(part.split("%")[0].split()[-1])
-                        return 100.0 - idle
+                    part = part.strip()
+                    if part.endswith("id"):
+                        # e.g. "99.3 id" -> take the number BEFORE "id", not the word itself
+                        return 100.0 - float(part.split()[0])
     except Exception:
         logger.exception("Failed to read host CPU usage")
     return 0.0
@@ -173,4 +174,3 @@ PLANS = {
     "Standard": {"ram": "12GB", "cpu": "2", "storage": "10GB", "price": {"Intel": 192, "AMD": 320}},
     "Pro":      {"ram": "16GB", "cpu": "2", "storage": "10GB", "price": {"Intel": 220, "AMD": 340}},
 }
-
