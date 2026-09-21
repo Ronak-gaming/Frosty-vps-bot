@@ -52,6 +52,17 @@ async def create_container(container_name: str, ram_mb: int, cpu_count, password
     except Exception:
         pass  # already present, or a transient registry hiccup — the run below will surface real problems
 
+    # Clear out any stale container with this name first. This can happen if a
+    # previous !create/!buywc attempt created the container but failed (or was
+    # interrupted) before it got saved to vps_data.json — next_container_id()
+    # only looks at vps_data, so it can't see an orphaned container on disk and
+    # will happily hand out an id that's already in use, causing
+    # "Conflict. The container name ... is already in use" on the next run.
+    try:
+        await run_docker(f"docker rm -f {container_name}", timeout=30)
+    except Exception:
+        pass  # nothing to remove — the normal case
+
     run_cmd = (
         f"docker run -d --name {container_name} "
         f"--memory={ram_mb}m --cpus={cpu_count} --restart=unless-stopped "
