@@ -9,7 +9,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
-from config import MAIN_ADMIN_ID, USER_DATA_FILE, VPS_DATA_FILE, ADMIN_DATA_FILE
+from config import MAIN_ADMIN_ID, USER_DATA_FILE, VPS_DATA_FILE, ADMIN_DATA_FILE, logger
 
 # ─── Persistence ────────────────────────────────────────────────────────────
 
@@ -133,5 +133,3 @@ def info_embed(title, description=""):
 
 def warning_embed(title, description=""):
     return base_embed(title, description, 0xFFAA00)
-
-
