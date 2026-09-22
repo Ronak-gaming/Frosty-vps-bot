@@ -112,21 +112,20 @@ async def get_tmate_session(container_name: str) -> str:
 
 
 async def get_or_create_vps_role(guild):
-    global VPS_USER_ROLE_ID
-    if VPS_USER_ROLE_ID:
-        role = guild.get_role(VPS_USER_ROLE_ID)
+    if config.VPS_USER_ROLE_ID:
+        role = guild.get_role(config.VPS_USER_ROLE_ID)
         if role:
             return role
     role = discord.utils.get(guild.roles, name="VPS User")
     if role:
-        VPS_USER_ROLE_ID = role.id
+        config.VPS_USER_ROLE_ID = role.id
         return role
     try:
         role = await guild.create_role(
             name="VPS User", color=discord.Color.dark_purple(),
             reason="VPS User role", permissions=discord.Permissions.none(),
         )
-        VPS_USER_ROLE_ID = role.id
+        config.VPS_USER_ROLE_ID = role.id
         return role
     except Exception:
         logger.exception("Failed to create VPS User role")
