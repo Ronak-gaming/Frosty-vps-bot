@@ -115,7 +115,7 @@ def is_main_admin():
 
 def base_embed(title, description="", color=0x1A1A1A):
     e = discord.Embed(title=f"▌ {title}", description=description, color=color)
-    e.set_footer(text=f"PrimeCloud | VPS Manager • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    e.set_footer(text=f"ApexHosting | VPS Manager • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     return e
 
 
