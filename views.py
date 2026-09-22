@@ -4,7 +4,7 @@ from datetime import datetime
 import discord
 
 from storage import vps_data, save_data, generate_password, base_embed, success_embed, error_embed, info_embed, warning_embed
-from docker_utils import run_docker, docker_exec, create_container, get_tmate_session
+from docker_utils import run_docker, docker_exec, create_container, get_ssh_access
 
 # ─── Management view (buttons + dropdown) ──────────────────────────────────
 
@@ -152,11 +152,14 @@ class ManageView(discord.ui.View):
                 await interaction.followup.send(embed=error_embed("SSH Error", "No stored credentials — please reinstall this VPS."), ephemeral=True)
                 return
             try:
-                tmate_cmd = await get_tmate_session(container)
+                method, value = await get_ssh_access(container)
                 e = base_embed("🔑 SSH Access", f"SSH connection for `{container}`:", 0x00FF88)
-                e.add_field(name="SSH Command (tmate)", value=f"```{tmate_cmd}```", inline=False)
+                if method == "sshx":
+                    e.add_field(name="SSHX Link (open in browser)", value=f"```{value}```", inline=False)
+                else:
+                    e.add_field(name="SSH Command (tmate — fallback)", value=f"```{value}```", inline=False)
                 e.add_field(name="Password", value=f"```{password}```", inline=True)
-                e.add_field(name="⚠️ Note", value="tmate session ends when the VPS restarts — click SSH again afterward.", inline=False)
+                e.add_field(name="⚠️ Note", value="Session ends when the VPS restarts — click SSH again afterward.", inline=False)
                 try:
                     await interaction.user.send(embed=e)
                     await interaction.followup.send(embed=success_embed("SSH Sent", "Check your DMs."), ephemeral=True)
