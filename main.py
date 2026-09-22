@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import discord
 from discord.ext import commands, tasks
 
-from config import bot, MAIN_ADMIN_ID, VPS_USER_ROLE_ID, BOT_START_TIME, logger
+from config import bot, MAIN_ADMIN_ID, BOT_START_TIME, logger
 import config
 import storage
 from storage import (
