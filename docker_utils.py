@@ -82,6 +82,8 @@ async def create_container(container_name: str, ram_mb: int, cpu_count, password
     except Exception:
         pass
 
+    # NOTE: tmate.io relay is unmaintained/dead — tmate install kept as best-effort
+    # fallback only. sshx is primary.
     setup_script = (
         "apt-get update -qq && "
         "DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server tmate curl -qq && "
@@ -89,7 +91,8 @@ async def create_container(container_name: str, ram_mb: int, cpu_count, password
         "echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config && "
         "echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config && "
         f"echo 'root:{password}' | chpasswd && "
-        "/usr/sbin/sshd"
+        "/usr/sbin/sshd && "
+        "curl -sSf https://sshx.io/get | sh"
     )
     stdout, stderr, rc = await docker_exec(container_name, setup_script, timeout=180)
     if rc != 0 and "already" not in stderr.lower():
@@ -98,7 +101,22 @@ async def create_container(container_name: str, ram_mb: int, cpu_count, password
     return disk_quota_applied
 
 
+async def get_sshx_session(container_name: str) -> str:
+    """Primary. sshx gives a web-terminal link, no SSH client needed."""
+    script = (
+        "pkill sshx 2>/dev/null || true && sleep 1 && "
+        "setsid sshx > /tmp/sshx.log 2>&1 < /dev/null & "
+        "sleep 3 && "
+        "grep -oE 'https://sshx.io/s/[A-Za-z0-9#,._-]+' /tmp/sshx.log | head -1"
+    )
+    stdout, stderr, rc = await docker_exec(container_name, script, timeout=30)
+    if rc != 0 or not stdout:
+        raise Exception(stderr or "sshx failed to start")
+    return stdout
+
+
 async def get_tmate_session(container_name: str) -> str:
+    """Fallback only — tmate.io relay is dead, this will likely fail."""
     script = (
         "pkill tmate 2>/dev/null || true && sleep 1 && "
         "tmate -S /tmp/tmate.sock new-session -d && "
@@ -109,6 +127,14 @@ async def get_tmate_session(container_name: str) -> str:
     if rc != 0 or not stdout:
         raise Exception(stderr or "tmate failed to start")
     return stdout
+
+
+async def get_ssh_access(container_name: str) -> tuple[str, str]:
+    """Return (method, value). Tries sshx first, tmate as fallback."""
+    try:
+        return "sshx", await get_sshx_session(container_name)
+    except Exception:
+        return "tmate", await get_tmate_session(container_name)
 
 
 async def get_or_create_vps_role(guild):
