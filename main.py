@@ -15,7 +15,7 @@ from storage import (
     base_embed, success_embed, error_embed, info_embed, warning_embed,
 )
 from docker_utils import (
-    run_docker, docker_exec, create_container, get_tmate_session,
+    run_docker, docker_exec, create_container, get_ssh_access,
     get_or_create_vps_role, PLANS,
 )
 from views import ManageView, ReinstallConfirmView
@@ -29,7 +29,7 @@ threading.Thread(target=docker_utils.cpu_monitor_loop, daemon=True).start()
 @bot.event
 async def on_ready():
     logger.info("%s connected to Discord", bot.user)
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="PrimeCloud | VPS Manager"))
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="ApexHosting | VPS Manager"))
     if not auto_expire_check.is_running():
         auto_expire_check.start()
 
@@ -126,13 +126,17 @@ async def create_vps(ctx, user: discord.Member, ram: int, cpu: int, disk: int = 
         await ctx.send(embed=e)
 
         try:
-            tmate_cmd = await get_tmate_session(container_name)
-            dm = base_embed("🎉 Your VPS is Ready!", "Connect using the command below.", 0x5865F2)
+            method, value = await get_ssh_access(container_name)
+            dm = base_embed("🎉 Your VPS is Ready!", "Connect using the info below.", 0x5865F2)
             dm.add_field(name="🆔 VPS ID", value=f"#{display_number}", inline=True)
             dm.add_field(name="🧠 RAM", value=f"{ram} GB", inline=True)
             dm.add_field(name="⚙️ CPU", value=f"{cpu} core(s)", inline=True)
-            dm.add_field(name="🔗 SSH Command", value=f"```{tmate_cmd}```", inline=False)
-            dm.add_field(name="📌 How to Connect", value="1️⃣ Copy the command\n2️⃣ Paste in a terminal\n3️⃣ You're in!", inline=False)
+            if method == "sshx":
+                dm.add_field(name="🔗 SSHX Link", value=f"```{value}```", inline=False)
+                dm.add_field(name="📌 How to Connect", value="1️⃣ Open the link in a browser\n2️⃣ You're in — no SSH client needed!", inline=False)
+            else:
+                dm.add_field(name="🔗 SSH Command (tmate — fallback)", value=f"```{value}```", inline=False)
+                dm.add_field(name="📌 How to Connect", value="1️⃣ Copy the command\n2️⃣ Paste in a terminal\n3️⃣ You're in!", inline=False)
             dm.add_field(name="🎮 Manage", value="`!manage` in the server", inline=False)
             await user.send(embed=dm)
         except discord.Forbidden:
@@ -271,7 +275,7 @@ async def revoke_share(ctx, target: discord.Member, vps_number: int):
 
 @bot.command(name="plans")
 async def show_plans(ctx):
-    e = base_embed("💎 VPS Plans — PrimeCloud", "Choose your plan:")
+    e = base_embed("💎 VPS Plans — ApexHosting", "Choose your plan:")
     for name, p in PLANS.items():
         e.add_field(
             name=name,
@@ -358,9 +362,12 @@ async def buy_with_credits(ctx, plan: str, processor: str = "Intel"):
         await ctx.send(embed=e)
 
         try:
-            tmate_cmd = await get_tmate_session(container_name)
-            dm = base_embed("🎉 Your VPS is Ready!", "Connect using the command below.", 0x5865F2)
-            dm.add_field(name="🔗 SSH Command", value=f"```{tmate_cmd}```", inline=False)
+            method, value = await get_ssh_access(container_name)
+            dm = base_embed("🎉 Your VPS is Ready!", "Connect using the info below.", 0x5865F2)
+            if method == "sshx":
+                dm.add_field(name="🔗 SSHX Link", value=f"```{value}```", inline=False)
+            else:
+                dm.add_field(name="🔗 SSH Command (tmate — fallback)", value=f"```{value}```", inline=False)
             dm.add_field(name="🎮 Manage", value="`!manage` in the server", inline=False)
             await ctx.author.send(embed=dm)
         except discord.Forbidden:
@@ -544,7 +551,7 @@ async def bot_status(ctx):
     minutes, _ = divmod(rem, 60)
     total = sum(len(v) for v in vps_data.values())
     running = sum(1 for vl in vps_data.values() for v in vl if v.get("status") == "running")
-    e = base_embed("🤖 Bot Status", "PrimeCloud VPS Manager", 0x00FF88)
+    e = base_embed("🤖 Bot Status", "ApexHosting VPS Manager", 0x00FF88)
     e.add_field(name="⏱️ Uptime", value=f"{delta.days}d {hours}h {minutes}m", inline=True)
     e.add_field(name="🖥️ Total VPS", value=f"{total} ({running} running)", inline=True)
     e.add_field(name="👥 Users", value=str(len(user_data)), inline=True)
@@ -757,7 +764,7 @@ async def cpu_monitor_control(ctx, action: str = "status"):
 async def announce(ctx, *, message: str):
     sent = failed = 0
     e = base_embed("📢 Announcement", message, 0xFFAA00)
-    e.add_field(name="From", value=f"PrimeCloud Team ({ctx.author.mention})", inline=False)
+    e.add_field(name="From", value=f"ApexHosting Team ({ctx.author.mention})", inline=False)
     status = await ctx.send(embed=info_embed("Sending", "Broadcasting to all VPS owners..."))
     for uid in vps_data.keys():
         try:
@@ -780,7 +787,7 @@ async def maintenance_toggle(ctx, mode: str):
         await ctx.send(embed=warning_embed("🔴 Maintenance Mode ON", "Non-admin commands are now blocked."))
     elif mode == "off":
         config.maintenance_mode = False
-        await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name="PrimeCloud | VPS Manager"))
+        await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name="ApexHosting | VPS Manager"))
         await ctx.send(embed=success_embed("🟢 Maintenance Mode OFF", "Bot is back to normal."))
     else:
         await ctx.send(embed=error_embed("Invalid", "Use: `!maintenance on` or `!maintenance off`"))
