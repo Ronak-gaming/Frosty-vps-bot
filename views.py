@@ -4,7 +4,7 @@ from datetime import datetime
 import discord
 
 from storage import vps_data, save_data, generate_password, base_embed, success_embed, error_embed, info_embed, warning_embed
-from docker_utils import run_docker, docker_exec, create_container, get_ssh_access
+from docker_utils import run_docker, docker_exec, create_container, get_ssh_access, classic_ssh_command
 
 # ─── Management view (buttons + dropdown) ──────────────────────────────────
 
@@ -116,7 +116,7 @@ class ManageView(discord.ui.View):
                 await interaction.response.send_message(embed=error_embed("Access Denied", "Only the VPS owner can reinstall."), ephemeral=True)
                 return
             await interaction.response.send_message(
-                embed=warning_embed("Reinstall Warning", f"⚠️ This will **erase all data** on `{container}` and reinstall Ubuntu 22.04. Continue?"),
+                embed=warning_embed("Reinstall Warning", f"⚠️ This will **erase all data** on `{container}` and reinstall {vps.get('os_label', vps.get('os_image', 'the original OS'))}. Continue?"),
                 view=ReinstallConfirmView(self, vps),
                 ephemeral=True,
             )
@@ -152,14 +152,17 @@ class ManageView(discord.ui.View):
                 await interaction.followup.send(embed=error_embed("SSH Error", "No stored credentials — please reinstall this VPS."), ephemeral=True)
                 return
             try:
-                method, value = await get_ssh_access(container)
-                e = base_embed("🔑 SSH Access", f"SSH connection for `{container}`:", 0x00FF88)
-                if method == "sshx":
-                    e.add_field(name="SSHX Link (open in browser)", value=f"```{value}```", inline=False)
-                else:
-                    e.add_field(name="SSH Command (tmate — fallback)", value=f"```{value}```", inline=False)
+                methods = await get_ssh_access(container)
+                e = base_embed("🔑 SSH Access", f"Connection options for `{container}`:", 0x00FF88)
+                port = vps.get("ssh_port")
+                if port:
+                    e.add_field(name="SSH (classic)", value=f"```{classic_ssh_command(port)}```", inline=False)
+                if "sshx" in methods:
+                    e.add_field(name="SSHX (browser link)", value=f"```{methods['sshx']}```", inline=False)
+                if not port and "sshx" not in methods:
+                    e.add_field(name="⚠️", value="No SSH method is currently reachable — try again in a moment.", inline=False)
                 e.add_field(name="Password", value=f"```{password}```", inline=True)
-                e.add_field(name="⚠️ Note", value="Session ends when the VPS restarts — click SSH again afterward.", inline=False)
+                e.add_field(name="⚠️ Note", value="sshx link ends when the VPS restarts — click SSH again afterward.", inline=False)
                 try:
                     await interaction.user.send(embed=e)
                     await interaction.followup.send(embed=success_embed("SSH Sent", "Check your DMs."), ephemeral=True)
@@ -190,7 +193,10 @@ class ReinstallConfirmView(discord.ui.View):
             ram_mb = int(self.vps["ram"].replace("GB", "")) * 1024
             disk_gb = int(str(self.vps.get("storage", "30GB")).replace("GB", ""))
             new_password = generate_password()
-            await create_container(container, ram_mb, self.vps["cpu"], new_password, disk_gb=disk_gb)
+            await create_container(
+                container, ram_mb, self.vps["cpu"], new_password, disk_gb=disk_gb,
+                os_image=self.vps.get("os_image"), ssh_port=self.vps.get("ssh_port"),
+            )
 
             self.vps["status"] = "running"
             self.vps["ssh_password"] = new_password
@@ -203,3 +209,31 @@ class ReinstallConfirmView(discord.ui.View):
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, _button):
         await interaction.response.edit_message(embed=self.parent.embed(), view=self.parent)
+
+
+
+# ─── OS picker (dropdown shown before a VPS is actually created) ──────────
+
+class OSPickerView(discord.ui.View):
+    """Shows the 6-OS dropdown, then calls on_pick(interaction, image_tag, label)."""
+    def __init__(self, actor_id, on_pick):
+        super().__init__(timeout=120)
+        self.actor_id = str(actor_id)
+        self.on_pick = on_pick
+        import config as _config
+        options = [
+            discord.SelectOption(label=label, value=image)
+            for label, image in _config.OS_CHOICES
+        ]
+        select = discord.ui.Select(placeholder="Choose an OS...", options=options)
+        select.callback = self._chosen
+        self.add_item(select)
+
+    async def _chosen(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.actor_id:
+            await interaction.response.send_message(embed=error_embed("Access Denied", "This isn't your setup."), ephemeral=True)
+            return
+        image = interaction.data["values"][0]
+        label = next((l for l, i in __import__("config").OS_CHOICES if i == image), image)
+        self.stop()
+        await self.on_pick(interaction, image, label)
