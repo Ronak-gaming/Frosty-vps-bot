@@ -18,7 +18,7 @@ from docker_utils import (
     run_docker, docker_exec, create_container, get_ssh_access,
     get_or_create_vps_role, PLANS,
 )
-from views import ManageView, ReinstallConfirmView
+from views import ManageView, ReinstallConfirmView, OSPickerView
 import threading
 import docker_utils
 
@@ -83,67 +83,73 @@ async def create_vps(ctx, user: discord.Member, ram: int, cpu: int, disk: int = 
         await ctx.send(embed=error_embed("Invalid Specs", "RAM, CPU and disk must all be positive integers."))
         return
 
-    user_id = str(user.id)
-    vps_data.setdefault(user_id, [])
-    display_number = len(vps_data[user_id]) + 1
-    container_name = f"vps-{user_id}-{next_container_id(user_id)}"
-    password = generate_password()
+    async def on_os_picked(interaction, image, os_label):
+        await interaction.response.edit_message(embed=info_embed("Creating VPS", f"Deploying for {user.mention} on **{os_label}**: `{ram}GB` RAM, `{cpu}` core(s), `{disk}GB` disk..."), view=None)
 
-    await ctx.send(embed=info_embed("Creating VPS", f"Deploying for {user.mention}: `{ram}GB` RAM, `{cpu}` core(s), `{disk}GB` disk..."))
-
-    try:
-        await create_container(container_name, ram * 1024, cpu, password, disk_gb=disk)
-
-        vps_data[user_id].append({
-            "container_name": container_name,
-            "ram": f"{ram}GB",
-            "cpu": str(cpu),
-            "storage": f"{disk}GB",
-            "status": "running",
-            "created_at": datetime.now().isoformat(),
-            "expires": "Never",
-            "ssh_password": password,
-            "shared_with": [],
-        })
-        save_data()
-
-        if ctx.guild:
-            role = await get_or_create_vps_role(ctx.guild)
-            if role:
-                try:
-                    await user.add_roles(role, reason="VPS ownership granted")
-                except discord.Forbidden:
-                    pass
-
-        e = base_embed("🚀 VPS Deployed!", f"{user.mention}'s VPS is live — SSH info sent via DM.", 0x00FF88)
-        e.add_field(name="👤 Owner", value=user.mention, inline=True)
-        e.add_field(name="🆔 VPS ID", value=f"#{display_number}", inline=True)
-        e.add_field(name="📦 Container", value=f"`{container_name}`", inline=True)
-        e.add_field(name="🧠 RAM", value=f"{ram} GB", inline=True)
-        e.add_field(name="⚙️ CPU", value=f"{cpu} core(s)", inline=True)
-        e.add_field(name="💾 Disk", value=f"{disk} GB", inline=True)
-        e.add_field(name="🎮 Manage", value="`!manage` → Start / Stop / Reinstall / SSH", inline=False)
-        await ctx.send(embed=e)
+        user_id = str(user.id)
+        vps_data.setdefault(user_id, [])
+        display_number = len(vps_data[user_id]) + 1
+        container_name = f"vps-{user_id}-{next_container_id(user_id)}"
+        password = generate_password()
+        ssh_port = docker_utils.next_ssh_port()
 
         try:
-            method, value = await get_ssh_access(container_name)
-            dm = base_embed("🎉 Your VPS is Ready!", "Connect using the info below.", 0x5865F2)
-            dm.add_field(name="🆔 VPS ID", value=f"#{display_number}", inline=True)
-            dm.add_field(name="🧠 RAM", value=f"{ram} GB", inline=True)
-            dm.add_field(name="⚙️ CPU", value=f"{cpu} core(s)", inline=True)
-            if method == "sshx":
-                dm.add_field(name="🔗 SSHX Link", value=f"```{value}```", inline=False)
-                dm.add_field(name="📌 How to Connect", value="1️⃣ Open the link in a browser\n2️⃣ You're in — no SSH client needed!", inline=False)
-            else:
-                dm.add_field(name="🔗 SSH Command (tmate — fallback)", value=f"```{value}```", inline=False)
-                dm.add_field(name="📌 How to Connect", value="1️⃣ Copy the command\n2️⃣ Paste in a terminal\n3️⃣ You're in!", inline=False)
-            dm.add_field(name="🎮 Manage", value="`!manage` in the server", inline=False)
-            await user.send(embed=dm)
-        except discord.Forbidden:
-            pass
+            await create_container(container_name, ram * 1024, cpu, password, disk_gb=disk, os_image=image, ssh_port=ssh_port)
 
-    except Exception as e:
-        await ctx.send(embed=error_embed("Creation Failed", str(e)))
+            vps_data[user_id].append({
+                "container_name": container_name,
+                "ram": f"{ram}GB",
+                "cpu": str(cpu),
+                "storage": f"{disk}GB",
+                "status": "running",
+                "created_at": datetime.now().isoformat(),
+                "expires": "Never",
+                "ssh_password": password,
+                "ssh_port": ssh_port,
+                "os_image": image,
+                "os_label": os_label,
+                "shared_with": [],
+            })
+            save_data()
+
+            if ctx.guild:
+                role = await get_or_create_vps_role(ctx.guild)
+                if role:
+                    try:
+                        await user.add_roles(role, reason="VPS ownership granted")
+                    except discord.Forbidden:
+                        pass
+
+            e = base_embed("🚀 VPS Deployed!", f"{user.mention}'s VPS is live — SSH info sent via DM.", 0x00FF88)
+            e.add_field(name="👤 Owner", value=user.mention, inline=True)
+            e.add_field(name="🆔 VPS ID", value=f"#{display_number}", inline=True)
+            e.add_field(name="📦 Container", value=f"`{container_name}`", inline=True)
+            e.add_field(name="🖥️ OS", value=os_label, inline=True)
+            e.add_field(name="🧠 RAM", value=f"{ram} GB", inline=True)
+            e.add_field(name="⚙️ CPU", value=f"{cpu} core(s)", inline=True)
+            e.add_field(name="💾 Disk", value=f"{disk} GB", inline=True)
+            e.add_field(name="🎮 Manage", value="`!manage` → Start / Stop / Reinstall / SSH", inline=False)
+            await ctx.send(embed=e)
+
+            try:
+                methods = await get_ssh_access(container_name)
+                dm = base_embed("🎉 Your VPS is Ready!", "Connect using the info below.", 0x5865F2)
+                dm.add_field(name="🆔 VPS ID", value=f"#{display_number}", inline=True)
+                dm.add_field(name="🖥️ OS", value=os_label, inline=True)
+                dm.add_field(name="🧠 RAM", value=f"{ram} GB", inline=True)
+                dm.add_field(name="⚙️ CPU", value=f"{cpu} core(s)", inline=True)
+                dm.add_field(name="🔑 SSH (classic)", value=f"```{docker_utils.classic_ssh_command(ssh_port)}```\nPassword: ```{password}```", inline=False)
+                if "sshx" in methods:
+                    dm.add_field(name="🔗 SSHX (browser link)", value=f"```{methods['sshx']}```", inline=False)
+                dm.add_field(name="🎮 Manage", value="`!manage` in the server", inline=False)
+                await user.send(embed=dm)
+            except discord.Forbidden:
+                pass
+
+        except Exception as e:
+            await ctx.send(embed=error_embed("Creation Failed", str(e)))
+
+    await ctx.send(embed=info_embed("Choose an OS", f"Pick the OS to install for {user.mention}'s VPS:"), view=OSPickerView(ctx.author.id, on_os_picked))
 
 
 @bot.command(name="manage")
@@ -319,64 +325,71 @@ async def buy_with_credits(ctx, plan: str, processor: str = "Intel"):
         await ctx.send(embed=error_embed("Insufficient Credits", f"Need {cost}, you have {user_data[user_id]['credits']}."))
         return
 
-    user_data[user_id]["credits"] -= cost
-    vps_data.setdefault(user_id, [])
-    display_number = len(vps_data[user_id]) + 1
-    container_name = f"vps-{user_id}-{next_container_id(user_id)}"
-    ram_str = PLANS[plan]["ram"]
-    cpu_str = PLANS[plan]["cpu"]
-    password = generate_password()
+    async def on_os_picked(interaction, image, os_label):
+        await interaction.response.edit_message(embed=info_embed("Processing Purchase", f"Deploying {plan} VPS on **{os_label}**..."), view=None)
 
-    await ctx.send(embed=info_embed("Processing Purchase", f"Deploying {plan} VPS..."))
-
-    try:
-        await create_container(container_name, int(ram_str.replace("GB", "")) * 1024, cpu_str, password)
-
-        vps_data[user_id].append({
-            "plan": plan,
-            "container_name": container_name,
-            "ram": ram_str,
-            "cpu": cpu_str,
-            "storage": PLANS[plan]["storage"],
-            "status": "running",
-            "created_at": datetime.now().isoformat(),
-            "processor": processor,
-            "expires": "Never",
-            "ssh_password": password,
-            "shared_with": [],
-        })
-        save_data()
-
-        if ctx.guild:
-            role = await get_or_create_vps_role(ctx.guild)
-            if role:
-                try:
-                    await ctx.author.add_roles(role, reason="VPS purchase")
-                except discord.Forbidden:
-                    pass
-
-        e = success_embed("VPS Purchased")
-        e.add_field(name="Plan", value=f"{plan} ({processor})", inline=True)
-        e.add_field(name="VPS ID", value=f"#{display_number}", inline=True)
-        e.add_field(name="Cost", value=f"{cost} credits", inline=True)
-        await ctx.send(embed=e)
+        user_data[user_id]["credits"] -= cost
+        vps_data.setdefault(user_id, [])
+        display_number = len(vps_data[user_id]) + 1
+        container_name = f"vps-{user_id}-{next_container_id(user_id)}"
+        ram_str = PLANS[plan]["ram"]
+        cpu_str = PLANS[plan]["cpu"]
+        password = generate_password()
+        ssh_port = docker_utils.next_ssh_port()
 
         try:
-            method, value = await get_ssh_access(container_name)
-            dm = base_embed("🎉 Your VPS is Ready!", "Connect using the info below.", 0x5865F2)
-            if method == "sshx":
-                dm.add_field(name="🔗 SSHX Link", value=f"```{value}```", inline=False)
-            else:
-                dm.add_field(name="🔗 SSH Command (tmate — fallback)", value=f"```{value}```", inline=False)
-            dm.add_field(name="🎮 Manage", value="`!manage` in the server", inline=False)
-            await ctx.author.send(embed=dm)
-        except discord.Forbidden:
-            pass
+            await create_container(container_name, int(ram_str.replace("GB", "")) * 1024, cpu_str, password, os_image=image, ssh_port=ssh_port)
 
-    except Exception as e:
-        user_data[user_id]["credits"] += cost  # refund on failure
-        save_data()
-        await ctx.send(embed=error_embed("Purchase Failed", f"{e}\n\nYour credits were refunded."))
+            vps_data[user_id].append({
+                "plan": plan,
+                "container_name": container_name,
+                "ram": ram_str,
+                "cpu": cpu_str,
+                "storage": PLANS[plan]["storage"],
+                "status": "running",
+                "created_at": datetime.now().isoformat(),
+                "processor": processor,
+                "expires": "Never",
+                "ssh_password": password,
+                "ssh_port": ssh_port,
+                "os_image": image,
+                "os_label": os_label,
+                "shared_with": [],
+            })
+            save_data()
+
+            if ctx.guild:
+                role = await get_or_create_vps_role(ctx.guild)
+                if role:
+                    try:
+                        await ctx.author.add_roles(role, reason="VPS purchase")
+                    except discord.Forbidden:
+                        pass
+
+            e = success_embed("VPS Purchased")
+            e.add_field(name="Plan", value=f"{plan} ({processor})", inline=True)
+            e.add_field(name="OS", value=os_label, inline=True)
+            e.add_field(name="VPS ID", value=f"#{display_number}", inline=True)
+            e.add_field(name="Cost", value=f"{cost} credits", inline=True)
+            await ctx.send(embed=e)
+
+            try:
+                methods = await get_ssh_access(container_name)
+                dm = base_embed("🎉 Your VPS is Ready!", "Connect using the info below.", 0x5865F2)
+                dm.add_field(name="🔑 SSH (classic)", value=f"```{docker_utils.classic_ssh_command(ssh_port)}```\nPassword: ```{password}```", inline=False)
+                if "sshx" in methods:
+                    dm.add_field(name="🔗 SSHX (browser link)", value=f"```{methods['sshx']}```", inline=False)
+                dm.add_field(name="🎮 Manage", value="`!manage` in the server", inline=False)
+                await ctx.author.send(embed=dm)
+            except discord.Forbidden:
+                pass
+
+        except Exception as e:
+            user_data[user_id]["credits"] += cost  # refund on failure
+            save_data()
+            await ctx.send(embed=error_embed("Purchase Failed", f"{e}\n\nYour credits were refunded."))
+
+    await ctx.send(embed=info_embed("Choose an OS", f"Pick the OS for your {plan} VPS:"), view=OSPickerView(ctx.author.id, on_os_picked))
 
 
 @bot.command(name="credits")
