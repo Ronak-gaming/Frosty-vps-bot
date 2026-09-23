@@ -9,7 +9,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
-from config import MAIN_ADMIN_ID, USER_DATA_FILE, VPS_DATA_FILE, ADMIN_DATA_FILE, logger
+from config import MAIN_ADMIN_ID, USER_DATA_FILE, VPS_DATA_FILE, ADMIN_DATA_FILE, INVITE_DATA_FILE, logger
 
 # ─── Persistence ────────────────────────────────────────────────────────────
 
@@ -39,10 +39,13 @@ def load_all():
     if str(MAIN_ADMIN_ID) not in admins["admins"]:
         admins["admins"].append(str(MAIN_ADMIN_ID))
 
-    return users, vps, admins
+    # {user_id: {"invites": int, "claimed_tier": int or None}}
+    invites = _load_json(INVITE_DATA_FILE, {})
+
+    return users, vps, admins, invites
 
 
-user_data, vps_data, admin_data = load_all()
+user_data, vps_data, admin_data, invite_data = load_all()
 _save_lock = threading.Lock()
 
 
@@ -55,6 +58,8 @@ def save_data():
                 json.dump(vps_data, f, indent=4)
             with open(ADMIN_DATA_FILE, "w") as f:
                 json.dump(admin_data, f, indent=4)
+            with open(INVITE_DATA_FILE, "w") as f:
+                json.dump(invite_data, f, indent=4)
         except Exception:
             logger.exception("Failed to save data")
 
