@@ -42,6 +42,29 @@ DATA_DIR = Path(__file__).resolve().parent
 USER_DATA_FILE = DATA_DIR / "user_data.json"
 VPS_DATA_FILE = DATA_DIR / "vps_data.json"
 ADMIN_DATA_FILE = DATA_DIR / "admin_data.json"
+INVITE_DATA_FILE = DATA_DIR / "invite_data.json"
+
+# label -> days (None = no expiry, "custom" = admin types a number)
+EXPIRY_CHOICES = [
+    ("1 Month", 30),
+    ("2 Months", 60),
+    ("3 Months", 90),
+    ("Custom...", "custom"),
+    ("No Expiry", None),
+]
+RENEW_EXTEND_DAYS = 30
+EXPIRY_WARN_DAYS = (5, 4, 3, 2, 1)   # send a reminder on each of these days-left
+
+# Invite-based rewards (no money) — cumulative invite count -> VPS spec.
+# Ordered smallest to largest; the highest tier a user qualifies for is usable.
+INVITE_TIERS = [
+    (6,  {"ram": 6,  "cpu": 2,  "storage": 64}),
+    (12, {"ram": 12, "cpu": 3,  "storage": 128}),
+    (16, {"ram": 16, "cpu": 4,  "storage": 192}),
+    (20, {"ram": 24, "cpu": 4,  "storage": 60}),
+    (30, {"ram": 32, "cpu": 8,  "storage": 280}),
+    (60, {"ram": 64, "cpu": 16, "storage": 300}),
+]
 
 intents = discord.Intents.default()
 intents.message_content = True
