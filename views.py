@@ -237,3 +237,64 @@ class OSPickerView(discord.ui.View):
         label = next((l for l, i in __import__("config").OS_CHOICES if i == image), image)
         self.stop()
         await self.on_pick(interaction, image, label)
+
+
+# ─── Expiry picker (dropdown shown right after OS pick, on !create) ───────
+
+class _CustomDaysModal(discord.ui.Modal, title="Custom Expiry"):
+    days = discord.ui.TextInput(label="Days until expiry", placeholder="e.g. 45")
+
+    def __init__(self, on_days):
+        super().__init__()
+        self.on_days = on_days
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            n = int(str(self.days.value).strip())
+            if n <= 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message(embed=error_embed("Invalid", "Enter a positive whole number of days."), ephemeral=True)
+            return
+        await self.on_days(interaction, n)
+
+
+class ExpiryPickerView(discord.ui.View):
+    """on_pick(interaction, days_or_none) — None means no expiry."""
+    def __init__(self, actor_id, on_pick):
+        super().__init__(timeout=120)
+        self.actor_id = str(actor_id)
+        self.on_pick = on_pick
+        import config as _config
+        options = [discord.SelectOption(label=label, value=str(days)) for label, days in _config.EXPIRY_CHOICES]
+        select = discord.ui.Select(placeholder="Choose an expiry...", options=options)
+        select.callback = self._chosen
+        self.add_item(select)
+
+    async def _chosen(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.actor_id:
+            await interaction.response.send_message(embed=error_embed("Access Denied", "This isn't your setup."), ephemeral=True)
+            return
+        value = interaction.data["values"][0]
+        if value == "custom":
+            async def _after_modal(modal_interaction, n):
+                self.stop()
+                await self.on_pick(modal_interaction, n)
+            await interaction.response.send_modal(_CustomDaysModal(_after_modal))
+            return
+        self.stop()
+        days = None if value == "None" else int(value)
+        await self.on_pick(interaction, days)
+
+
+# ─── Renew button (sent with expiry-warning DMs) ───────────────────────────
+
+class RenewView(discord.ui.View):
+    """on_renew(interaction) does the actual extend-and-save."""
+    def __init__(self, on_renew):
+        super().__init__(timeout=None)
+        self.on_renew = on_renew
+
+    @discord.ui.button(label="🔁 Renew Now (+30 days)", style=discord.ButtonStyle.success)
+    async def renew(self, interaction: discord.Interaction, _button):
+        await self.on_renew(interaction)
