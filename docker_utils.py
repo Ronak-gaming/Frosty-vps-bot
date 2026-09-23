@@ -8,7 +8,7 @@ import time
 import discord
 
 import config
-from config import DOCKER_IMAGE, CPU_THRESHOLD, CPU_CHECK_INTERVAL, logger
+from config import DOCKER_IMAGE, CPU_THRESHOLD, CPU_CHECK_INTERVAL, SSH_PORT_START, SERVER_PUBLIC_IP, logger
 import storage
 from storage import vps_data, save_data
 
@@ -42,13 +42,25 @@ async def docker_exec(container: str, command: str, timeout=60):
     return stdout.decode().strip(), stderr.decode().strip(), proc.returncode
 
 
-async def create_container(container_name: str, ram_mb: int, cpu_count, password: str, disk_gb: int = 30):
+def next_ssh_port() -> int:
+    """Smallest free host port for -p mapping, avoiding ports already given out."""
+    used = {v.get("ssh_port") for vl in vps_data.values() for v in vl if v.get("ssh_port")}
+    port = SSH_PORT_START
+    while port in used:
+        port += 1
+    return port
+
+
+async def create_container(container_name: str, ram_mb: int, cpu_count, password: str,
+                            disk_gb: int = 30, os_image: str = None, ssh_port: int = None):
     """
     Create and provision a Docker container as a VPS.
-    SSH access is via tmate (no port needs to be exposed on the host).
+    Real SSH is exposed via -p {ssh_port}:22; sshx is also set up as a
+    browser-based alternative that needs no port/client.
     """
+    image = os_image or DOCKER_IMAGE
     try:
-        await run_docker(f"docker pull {DOCKER_IMAGE}", timeout=300)
+        await run_docker(f"docker pull {image}", timeout=300)
     except Exception:
         pass  # already present, or a transient registry hiccup — the run below will surface real problems
 
@@ -63,10 +75,11 @@ async def create_container(container_name: str, ram_mb: int, cpu_count, password
     except Exception:
         pass  # nothing to remove — the normal case
 
+    port_flag = f"-p {ssh_port}:22 " if ssh_port else ""
     run_cmd = (
-        f"docker run -d --name {container_name} "
+        f"docker run -d --name {container_name} {port_flag}"
         f"--memory={ram_mb}m --cpus={cpu_count} --restart=unless-stopped "
-        f"{DOCKER_IMAGE} sleep infinity"
+        f"{image} sleep infinity"
     )
     await run_docker(run_cmd, timeout=60)
 
@@ -82,19 +95,22 @@ async def create_container(container_name: str, ram_mb: int, cpu_count, password
     except Exception:
         pass
 
-    # NOTE: tmate.io relay is unmaintained/dead — tmate install kept as best-effort
-    # fallback only. sshx is primary.
+    # NOTE: tmate.io relay is unmaintained/dead — kept as a best-effort extra,
+    # sshx is the reliable one. Post-boot: auto update/upgrade + screenfetch
+    # on every login (motd-style, via .bashrc).
     setup_script = (
         "apt-get update -qq && "
-        "DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server tmate curl -qq && "
+        "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq && "
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server tmate curl screenfetch -qq && "
         "mkdir -p /var/run/sshd && "
         "echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config && "
         "echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config && "
         f"echo 'root:{password}' | chpasswd && "
         "/usr/sbin/sshd && "
-        "curl -sSf https://sshx.io/get | sh"
+        "curl -sSf https://sshx.io/get | sh ; "
+        "grep -qxF 'screenfetch' /root/.bashrc || echo 'screenfetch' >> /root/.bashrc"
     )
-    stdout, stderr, rc = await docker_exec(container_name, setup_script, timeout=180)
+    stdout, stderr, rc = await docker_exec(container_name, setup_script, timeout=240)
     if rc != 0 and "already" not in stderr.lower():
         raise Exception(f"SSH setup failed: {stderr}")
 
@@ -102,7 +118,7 @@ async def create_container(container_name: str, ram_mb: int, cpu_count, password
 
 
 async def get_sshx_session(container_name: str) -> str:
-    """Primary. sshx gives a web-terminal link, no SSH client needed."""
+    """sshx: browser-based terminal link, no SSH client needed."""
     script = (
         "pkill sshx 2>/dev/null || true && sleep 1 && "
         "setsid sshx > /tmp/sshx.log 2>&1 < /dev/null & "
@@ -116,7 +132,7 @@ async def get_sshx_session(container_name: str) -> str:
 
 
 async def get_tmate_session(container_name: str) -> str:
-    """Fallback only — tmate.io relay is dead, this will likely fail."""
+    """tmate — relay is dead as of 2026, kept only in case a private relay is configured."""
     script = (
         "pkill tmate 2>/dev/null || true && sleep 1 && "
         "tmate -S /tmp/tmate.sock new-session -d && "
@@ -129,12 +145,18 @@ async def get_tmate_session(container_name: str) -> str:
     return stdout
 
 
-async def get_ssh_access(container_name: str) -> tuple[str, str]:
-    """Return (method, value). Tries sshx first, tmate as fallback."""
+def classic_ssh_command(ssh_port: int) -> str:
+    return f"ssh root@{SERVER_PUBLIC_IP} -p {ssh_port}"
+
+
+async def get_ssh_access(container_name: str) -> dict:
+    """Return every SSH method that worked: {'ssh': 'ssh root@ip -p port', 'sshx': 'https://...'}."""
+    methods = {}
     try:
-        return "sshx", await get_sshx_session(container_name)
+        methods["sshx"] = await get_sshx_session(container_name)
     except Exception:
-        return "tmate", await get_tmate_session(container_name)
+        logger.warning("sshx failed for %s", container_name)
+    return methods
 
 
 async def get_or_create_vps_role(guild):
