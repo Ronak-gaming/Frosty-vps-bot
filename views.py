@@ -1,10 +1,58 @@
-"""Discord UI views for VPS management (buttons + dropdown)."""
+"""Discord UI views for multi-node VPS management (buttons + dropdowns)."""
 from datetime import datetime
 
 import discord
 
-from storage import vps_data, save_data, generate_password, base_embed, success_embed, error_embed, info_embed, warning_embed
+import config as _config
+from storage import (
+    vps_data, nodes_data, get_node_info, save_data, generate_password,
+    base_embed, success_embed, error_embed, info_embed, warning_embed,
+)
 from docker_utils import run_docker, docker_exec, create_container, get_ssh_access, classic_ssh_command
+
+
+# ─── Node Picker View (asks which Node to use before deploying/managing) ────
+
+class NodePickerView(discord.ui.View):
+    """
+    Prompts the user/admin to select which named Node to use.
+    Calls on_pick(interaction, node_name).
+    """
+    def __init__(self, actor_id, on_pick, placeholder="Select a Node..."):
+        super().__init__(timeout=120)
+        self.actor_id = str(actor_id)
+        self.on_pick = on_pick
+
+        options = []
+        for name, info in list(nodes_data.items())[:25]:
+            loc_tag = "Local" if info.get("is_local") else "Remote"
+            options.append(
+                discord.SelectOption(
+                    label=f"🖥️ {name}",
+                    description=f"IP: {info.get('ip', '?')} ({loc_tag} Node)",
+                    value=name,
+                )
+            )
+
+        select = discord.ui.Select(placeholder=placeholder, options=options)
+        select.callback = self._chosen
+        self.add_item(select)
+
+    async def _chosen(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.actor_id:
+            await interaction.response.send_message(
+                embed=error_embed("Access Denied", "This isn't your session."), ephemeral=True
+            )
+            return
+        node_name = interaction.data["values"][0]
+        if node_name not in nodes_data:
+            await interaction.response.send_message(
+                embed=error_embed("Node Not Found", f"Node `{node_name}` no longer exists."), ephemeral=True
+            )
+            return
+        self.stop()
+        await self.on_pick(interaction, node_name)
+
 
 # ─── Management view (buttons + dropdown) ──────────────────────────────────
 
@@ -24,12 +72,12 @@ class ManageView(discord.ui.View):
         if len(self.vps_list) > 1:
             options = [
                 discord.SelectOption(
-                    label=f"VPS {i + 1} ({v.get('plan', 'Custom')})",
-                    description=f"Status: {v.get('status', 'unknown')}",
+                    label=f"VPS {i + 1} — {v.get('nickname') or v.get('plan', 'Custom')} [{v.get('node', 'Node')}]"[:100],
+                    description=f"Node: {v.get('node', '?')} | Status: {v.get('status', 'unknown')}",
                     value=str(i),
                     default=(i == self.selected),
                 )
-                for i, v in enumerate(self.vps_list)
+                for i, v in enumerate(self.vps_list[:25])
             ]
             select = discord.ui.Select(placeholder="Select a VPS to manage", options=options)
             select.callback = self._on_select
@@ -54,14 +102,16 @@ class ManageView(discord.ui.View):
 
     def embed(self):
         vps = self.vps_list[self.selected]
+        node_name = vps.get("node", get_node_info()["name"])
+        node_ip = get_node_info(node_name).get("ip", "?")
         color = 0x00FF88 if vps.get("status") == "running" else 0xFF3366
         owner_text = ""
         if self.is_admin_view and self.owner_id != self.actor_id:
             owner_text = f"\n**Owner ID:** {self.owner_id}"
 
         e = base_embed(
-            f"VPS Management — VPS {self.selected + 1}",
-            f"Managing container: `{vps['container_name']}`{owner_text}",
+            f"VPS Management — {vps.get('nickname') or f'VPS {self.selected + 1}'}",
+            f"**Node:** `{node_name}` (`{node_ip}`)\n**Container:** `{vps['container_name']}`{owner_text}",
             color,
         )
 
@@ -76,19 +126,21 @@ class ManageView(discord.ui.View):
             expire_str = "Never"
 
         e.add_field(
-            name="📊 Resources",
+            name="📊 Resources & Details",
             value=(
+                f"**Node:** `{node_name}`\n"
+                f"**OS:** {vps.get('os_label', vps.get('os_image', 'Ubuntu'))}\n"
                 f"**Plan:** {vps.get('plan', 'Custom')}\n"
                 f"**Status:** `{vps.get('status', 'unknown').upper()}`\n"
                 f"**RAM:** {vps.get('ram', '?')}\n"
                 f"**CPU:** {vps.get('cpu', '?')} Core(s)\n"
-                f"**Storage:** {vps.get('storage', '?')} (best-effort, not a hard quota)\n"
+                f"**Storage:** {vps.get('storage', '?')}\n"
                 f"**Created:** {vps.get('created_at', '?')[:10]}\n"
                 f"**Expires:** {expire_str}"
             ),
             inline=False,
         )
-        e.add_field(name="🎮 Controls", value="Use the buttons below to manage your VPS", inline=False)
+        e.add_field(name="🎮 Controls", value="Use the buttons below to manage your VPS on this node", inline=False)
         return e
 
     async def _authorized(self, interaction) -> bool:
@@ -108,15 +160,22 @@ class ManageView(discord.ui.View):
         if not await self._authorized(interaction):
             return
 
-        vps = vps_data[self.owner_id][self.selected]
+        # Use self.vps_list[self.selected] directly so shared views and filtered node views
+        # always target the exact VPS dictionary being displayed!
+        vps = self.vps_list[self.selected]
         container = vps["container_name"]
+        node_name = vps.get("node")
 
         if action == "reinstall":
             if self.is_shared or self.is_admin_view:
                 await interaction.response.send_message(embed=error_embed("Access Denied", "Only the VPS owner can reinstall."), ephemeral=True)
                 return
             await interaction.response.send_message(
-                embed=warning_embed("Reinstall Warning", f"⚠️ This will **erase all data** on `{container}` and reinstall {vps.get('os_label', vps.get('os_image', 'the original OS'))}. Continue?"),
+                embed=warning_embed(
+                    "Reinstall Warning",
+                    f"⚠️ This will **erase all data** on `{container}` (Node: `{node_name}`) and reinstall "
+                    f"{vps.get('os_label', vps.get('os_image', 'the original OS'))}. Continue?",
+                ),
                 view=ReinstallConfirmView(self, vps),
                 ephemeral=True,
             )
@@ -125,11 +184,11 @@ class ManageView(discord.ui.View):
         if action == "start":
             await interaction.response.defer(ephemeral=True)
             try:
-                await run_docker(f"docker start {container}")
-                await docker_exec(container, "/usr/sbin/sshd || true", timeout=10)
+                await run_docker(f"docker start {container}", node=node_name)
+                await docker_exec(container, "mkdir -p /run/sshd /var/run/sshd && /usr/sbin/sshd || true", timeout=15, node=node_name)
                 vps["status"] = "running"
                 save_data()
-                await interaction.followup.send(embed=success_embed("VPS Started", f"`{container}` is now running."), ephemeral=True)
+                await interaction.followup.send(embed=success_embed("VPS Started", f"`{container}` is now running on `{node_name}`."), ephemeral=True)
                 await interaction.message.edit(embed=self.embed(), view=self)
             except Exception as e:
                 await interaction.followup.send(embed=error_embed("Start Failed", str(e)), ephemeral=True)
@@ -137,10 +196,10 @@ class ManageView(discord.ui.View):
         elif action == "stop":
             await interaction.response.defer(ephemeral=True)
             try:
-                await run_docker(f"docker stop {container}", timeout=120)
+                await run_docker(f"docker stop {container}", timeout=120, node=node_name)
                 vps["status"] = "stopped"
                 save_data()
-                await interaction.followup.send(embed=success_embed("VPS Stopped", f"`{container}` has been stopped."), ephemeral=True)
+                await interaction.followup.send(embed=success_embed("VPS Stopped", f"`{container}` has been stopped on `{node_name}`."), ephemeral=True)
                 await interaction.message.edit(embed=self.embed(), view=self)
             except Exception as e:
                 await interaction.followup.send(embed=error_embed("Stop Failed", str(e)), ephemeral=True)
@@ -152,16 +211,17 @@ class ManageView(discord.ui.View):
                 await interaction.followup.send(embed=error_embed("SSH Error", "No stored credentials — please reinstall this VPS."), ephemeral=True)
                 return
             try:
-                methods = await get_ssh_access(container)
-                e = base_embed("🔑 SSH Access", f"Connection options for `{container}`:", 0x00FF88)
+                methods = await get_ssh_access(container, node=node_name)
+                e = base_embed("🔑 SSH Access", f"Connection options for `{container}` on node `{node_name}`:", 0x00FF88)
                 port = vps.get("ssh_port")
                 if port:
-                    e.add_field(name="SSH (classic)", value=f"```{classic_ssh_command(port)}```", inline=False)
+                    e.add_field(name="SSH (classic)", value=f"```{classic_ssh_command(port, node=node_name)}```", inline=False)
                 if "sshx" in methods:
                     e.add_field(name="SSHX (browser link)", value=f"```{methods['sshx']}```", inline=False)
                 if not port and "sshx" not in methods:
                     e.add_field(name="⚠️", value="No SSH method is currently reachable — try again in a moment.", inline=False)
                 e.add_field(name="Password", value=f"```{password}```", inline=True)
+                e.add_field(name="🖥️ Node", value=f"`{node_name}`", inline=True)
                 e.add_field(name="⚠️ Note", value="sshx link ends when the VPS restarts — click SSH again afterward.", inline=False)
                 try:
                     await interaction.user.send(embed=e)
@@ -182,34 +242,35 @@ class ReinstallConfirmView(discord.ui.View):
     async def confirm(self, interaction: discord.Interaction, _button):
         await interaction.response.defer(ephemeral=True)
         container = self.vps["container_name"]
+        node_name = self.vps.get("node")
         try:
-            await interaction.followup.send(embed=info_embed("Reinstalling", f"Removing `{container}`..."), ephemeral=True)
+            await interaction.followup.send(embed=info_embed("Reinstalling", f"Removing `{container}` on `{node_name}`..."), ephemeral=True)
             try:
-                await run_docker(f"docker stop {container}")
+                await run_docker(f"docker stop {container}", node=node_name)
             except Exception:
                 pass
-            await run_docker(f"docker rm -f {container}")
+            await run_docker(f"docker rm -f {container}", node=node_name)
 
-            ram_mb = int(self.vps["ram"].replace("GB", "")) * 1024
+            ram_mb = int(str(self.vps["ram"]).replace("GB", "")) * 1024
             disk_gb = int(str(self.vps.get("storage", "30GB")).replace("GB", ""))
             new_password = generate_password()
             await create_container(
                 container, ram_mb, self.vps["cpu"], new_password, disk_gb=disk_gb,
                 os_image=self.vps.get("os_image"), ssh_port=self.vps.get("ssh_port"),
+                node=node_name,
             )
 
             self.vps["status"] = "running"
             self.vps["ssh_password"] = new_password
             self.vps["created_at"] = datetime.now().isoformat()
             save_data()
-            await interaction.followup.send(embed=success_embed("Reinstall Complete", f"`{container}` reinstalled."), ephemeral=True)
+            await interaction.followup.send(embed=success_embed("Reinstall Complete", f"`{container}` reinstalled on `{node_name}`. Click 🔑 SSH for your new password."), ephemeral=True)
         except Exception as e:
             await interaction.followup.send(embed=error_embed("Reinstall Failed", str(e)), ephemeral=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, _button):
         await interaction.response.edit_message(embed=self.parent.embed(), view=self.parent)
-
 
 
 # ─── OS picker (dropdown shown before a VPS is actually created) ──────────
@@ -220,7 +281,6 @@ class OSPickerView(discord.ui.View):
         super().__init__(timeout=120)
         self.actor_id = str(actor_id)
         self.on_pick = on_pick
-        import config as _config
         options = [
             discord.SelectOption(label=label, value=image)
             for label, image in _config.OS_CHOICES
@@ -234,7 +294,7 @@ class OSPickerView(discord.ui.View):
             await interaction.response.send_message(embed=error_embed("Access Denied", "This isn't your setup."), ephemeral=True)
             return
         image = interaction.data["values"][0]
-        label = next((l for l, i in __import__("config").OS_CHOICES if i == image), image)
+        label = next((l for l, i in _config.OS_CHOICES if i == image), image)
         self.stop()
         await self.on_pick(interaction, image, label)
 
@@ -265,7 +325,6 @@ class ExpiryPickerView(discord.ui.View):
         super().__init__(timeout=120)
         self.actor_id = str(actor_id)
         self.on_pick = on_pick
-        import config as _config
         options = [discord.SelectOption(label=label, value=str(days)) for label, days in _config.EXPIRY_CHOICES]
         select = discord.ui.Select(placeholder="Choose an expiry...", options=options)
         select.callback = self._chosen
