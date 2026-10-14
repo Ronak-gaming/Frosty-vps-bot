@@ -1,46 +1,57 @@
-"""Bot entrypoint: events, all commands, and run()."""
+"""Bot entrypoint: events, multi-node management, all VPS commands, and run()."""
 import asyncio
 import os
+import time
 from datetime import datetime, timedelta
 
 import discord
 from discord.ext import commands, tasks
 
-from config import bot, MAIN_ADMIN_ID, BOT_START_TIME, logger
+from config import bot, MAIN_ADMIN_ID, BOT_START_TIME, CPU_THRESHOLD, CPU_CHECK_INTERVAL, logger
 import config
-import storage
 from storage import (
-    user_data, vps_data, admin_data, invite_data, save_data, is_admin_id, is_admin, is_main_admin,
+    user_data, vps_data, admin_data, invite_data, nodes_data,
+    get_default_node, get_node_info, find_vps_by_container,
+    save_data, is_admin_id, is_admin, is_main_admin,
     generate_password, next_container_id,
     base_embed, success_embed, error_embed, info_embed, warning_embed,
 )
 from docker_utils import (
     run_docker, docker_exec, create_container, get_ssh_access,
-    get_or_create_vps_role, PLANS,
+    get_or_create_vps_role, pair_remote_node, get_node_live_stats, PLANS,
 )
-from views import ManageView, ReinstallConfirmView, OSPickerView, ExpiryPickerView, RenewView
-import threading
+from views import ManageView, NodePickerView, OSPickerView, ExpiryPickerView, RenewView
 import docker_utils
 
-threading.Thread(target=docker_utils.cpu_monitor_loop, daemon=True).start()
-
-invite_cache = {}   # guild_id -> {invite_code: uses}, refreshed on_ready and kept live below
+invite_cache = {}
 
 
 def _tier_for_invites(n: int):
-    """Highest invite tier the count qualifies for, or None."""
     tier = None
-    for threshold, spec in config.INVITE_TIERS:
+    for threshold, _spec in config.INVITE_TIERS:
         if n >= threshold:
             tier = threshold
     return tier
+
+
+# Helper: if there are multiple nodes, show NodePickerView; if only 1 node exists,
+# still show NodePickerView so the user explicitly sees and confirms the custom node name!
+async def prompt_node_selection(ctx, title: str, prompt_text: str, on_node_picked):
+    if not nodes_data:
+        await ctx.send(embed=error_embed("No Nodes Configured", "Add a node first with `!node-add`."))
+        return
+    await ctx.send(
+        embed=info_embed(title, prompt_text),
+        view=NodePickerView(ctx.author.id, on_node_picked),
+    )
+
 
 # ─── Bot events ─────────────────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
-    logger.info("%s connected to Discord", bot.user)
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="ApexHosting | VPS Manager"))
+    logger.info("%s connected to Discord (%d nodes configured)", bot.user, len(nodes_data))
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="ApexHosting | Multi-Node VPS"))
     for guild in bot.guilds:
         try:
             invite_cache[guild.id] = {inv.code: inv.uses for inv in await guild.invites()}
@@ -62,7 +73,6 @@ async def on_invite_delete(invite: discord.Invite):
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    """Diff cached invite uses vs current to find who invited this member, then credit them."""
     guild = member.guild
     try:
         current = {inv.code: (inv.uses, inv.inviter) for inv in await guild.invites()}
@@ -70,6 +80,7 @@ async def on_member_join(member: discord.Member):
         return
     cached = invite_cache.get(guild.id, {})
     used_code = None
+    inviter_id = None
     for code, (uses, inviter) in current.items():
         if uses > cached.get(code, 0):
             used_code = code
@@ -77,9 +88,12 @@ async def on_member_join(member: discord.Member):
             break
     invite_cache[guild.id] = {code: uses for code, (uses, _) in current.items()}
     if used_code and inviter_id and inviter_id != str(member.id):
-        invite_data.setdefault(inviter_id, {"invites": 0, "claimed_tier": None})
-        invite_data[inviter_id]["invites"] += 1
-        save_data()
+        rec = invite_data.setdefault(inviter_id, {"invites": 0, "claimed_tier": None, "invited_users": []})
+        rec.setdefault("invited_users", [])
+        if str(member.id) not in rec["invited_users"]:
+            rec["invited_users"].append(str(member.id))
+            rec["invites"] += 1
+            save_data()
 
 
 @bot.event
@@ -121,158 +135,367 @@ async def on_message(message):
     await bot.process_commands(message)
 
 
+# ─── Multi-Node Management Commands ─────────────────────────────────────────
+
+@bot.command(name="node-add")
+@is_admin()
+async def node_add(ctx, name: str, ip: str, ssh_port: int = 22, *, root_password: str = None):
+    """
+    !node-add <NodeName> <IP> [ssh_port] [root_password]
+    - If root_password is omitted and IP matches this machine, registers/renames the local node.
+    - If root_password is provided, pairs with the remote VPS over SSH and sets up Docker automatically.
+    """
+    try:
+        await ctx.message.delete()  # Delete command message immediately so root password isn't left in chat
+    except Exception:
+        pass
+
+    clean_name = "".join(c for c in name if c.isalnum() or c in ("-", "_"))[:32]
+    if not clean_name:
+        await ctx.send(embed=error_embed("Invalid Node Name", "Use letters, numbers, hyphens, or underscores."))
+        return
+
+    if not root_password or ip in ("127.0.0.1", "localhost", config.SERVER_PUBLIC_IP):
+        actual_ip = config.SERVER_PUBLIC_IP if ip in ("127.0.0.1", "localhost") else ip
+        nodes_data[clean_name] = {
+            "name": clean_name,
+            "ip": actual_ip,
+            "ssh_port": ssh_port,
+            "user": "root",
+            "is_local": True,
+            "added_at": datetime.now().isoformat(),
+        }
+        save_data()
+        await ctx.send(embed=success_embed("Local Node Registered", f"Node **`{clean_name}`** (`{actual_ip}`) is registered as a local node."))
+        return
+
+    status_msg = await ctx.send(embed=info_embed("Pairing Remote Node...", f"Connecting to **`{clean_name}`** (`{ip}:{ssh_port}`), installing SSH key, and verifying Docker..."))
+    ok, detail = await pair_remote_node(ip, ssh_port, root_password.strip())
+    if not ok:
+        await status_msg.edit(embed=error_embed("Node Pairing Failed", f"Could not link **`{clean_name}`** (`{ip}:{ssh_port}`):\n```{detail[:800]}```"))
+        return
+
+    nodes_data[clean_name] = {
+        "name": clean_name,
+        "ip": ip,
+        "ssh_port": ssh_port,
+        "user": "root",
+        "is_local": False,
+        "added_at": datetime.now().isoformat(),
+    }
+    save_data()
+    await status_msg.edit(embed=success_embed("🟢 Remote Node Connected!", f"Node **`{clean_name}`** (`{ip}:{ssh_port}`) is now online and controlled by this bot.\n{detail}"))
+
+
+@bot.command(name="node-rename")
+@is_admin()
+async def node_rename(ctx, old_name: str, new_name: str):
+    """!node-rename <OldName> <NewName> — rename an existing node and update all its VPS records."""
+    if old_name not in nodes_data:
+        await ctx.send(embed=error_embed("Not Found", f"Node `{old_name}` does not exist."))
+        return
+    clean_new = "".join(c for c in new_name if c.isalnum() or c in ("-", "_"))[:32]
+    if not clean_new or clean_new in nodes_data:
+        await ctx.send(embed=error_embed("Invalid Name", f"Name `{clean_new}` is invalid or already exists."))
+        return
+
+    info = nodes_data.pop(old_name)
+    info["name"] = clean_new
+    nodes_data[clean_new] = info
+
+    for vl in vps_data.values():
+        for v in vl:
+            if v.get("node") == old_name:
+                v["node"] = clean_new
+    save_data()
+    await ctx.send(embed=success_embed("Node Renamed", f"Node `{old_name}` has been renamed to **`{clean_new}`**."))
+
+
+@bot.command(name="node-remove")
+@is_admin()
+async def node_remove(ctx, name: str):
+    """!node-remove <NodeName> — remove a node from the bot."""
+    if name not in nodes_data:
+        await ctx.send(embed=error_embed("Not Found", f"Node `{name}` does not exist."))
+        return
+    if len(nodes_data) <= 1:
+        await ctx.send(embed=error_embed("Cannot Remove", "You must keep at least one node registered."))
+        return
+    active_on_node = sum(1 for vl in vps_data.values() for v in vl if v.get("node") == name)
+    if active_on_node > 0:
+        await ctx.send(embed=error_embed("Node In Use", f"Node `{name}` still has **{active_on_node}** VPS container(s) registered on it. Delete them first."))
+        return
+    del nodes_data[name]
+    save_data()
+    await ctx.send(embed=success_embed("Node Removed", f"Node **`{name}`** was removed."))
+
+
+@bot.command(name="node-list")
+async def node_list(ctx):
+    """!node-list — view all connected nodes and their live status."""
+    msg = await ctx.send(embed=info_embed("Querying Nodes...", "Checking live status across all connected nodes..."))
+    e = base_embed("🌐 Connected VPS Nodes", f"Total Nodes: **{len(nodes_data)}**", 0x00CCFF)
+    for name, info in nodes_data.items():
+        stats = await get_node_live_stats(name)
+        vps_count = sum(1 for vl in vps_data.values() for v in vl if v.get("node") == name)
+        status_icon = "🟢 ONLINE" if stats["online"] else "🔴 OFFLINE"
+        mode_str = "Local Host" if info.get("is_local") else f"Remote SSH (Port {info.get('ssh_port', 22)})"
+        e.add_field(
+            name=f"🖥️ {name} — {status_icon}",
+            value=(
+                f"**IP:** `{info.get('ip', '?')}`\n"
+                f"**Type:** {mode_str}\n"
+                f"**RAM Usage:** `{stats['ram']}`\n"
+                f"**CPU Cores:** `{stats['cpus']}`\n"
+                f"**Bot VPS Count:** `{vps_count}` (Running Containers: `{stats['containers']}`)"
+            ),
+            inline=False,
+        )
+    await msg.edit(embed=e)
+
+
 # ─── VPS creation & management commands ────────────────────────────────────
 
 @bot.command(name="create")
 @is_admin()
 async def create_vps(ctx, user: discord.Member, ram: int, cpu: int, disk: int = 30):
-    """!create @user <ram_GB> <cpu_cores> <disk_GB> — create a custom VPS (admin only)"""
+    """!create @user <ram_GB> <cpu_cores> <disk_GB> — asks which Node, OS, and Expiry to deploy on."""
     if ram <= 0 or cpu <= 0 or disk <= 0:
         await ctx.send(embed=error_embed("Invalid Specs", "RAM, CPU and disk must all be positive integers."))
         return
 
-    async def on_os_picked(interaction, image, os_label):
-        async def on_expiry_picked(interaction2, expiry_days):
-            await interaction2.response.edit_message(embed=info_embed("Creating VPS", f"Deploying for {user.mention} on **{os_label}**: `{ram}GB` RAM, `{cpu}` core(s), `{disk}GB` disk..."), view=None)
+    async def on_node_picked(node_interaction, node_name):
+        async def on_os_picked(os_interaction, image, os_label):
+            async def on_expiry_picked(exp_interaction, expiry_days):
+                await exp_interaction.response.edit_message(
+                    embed=info_embed(
+                        "Creating VPS",
+                        f"Deploying for {user.mention} on Node **`{node_name}`** (**{os_label}**): `{ram}GB` RAM, `{cpu}` core(s), `{disk}GB` disk...",
+                    ),
+                    view=None,
+                )
 
-            user_id = str(user.id)
-            vps_data.setdefault(user_id, [])
-            display_number = len(vps_data[user_id]) + 1
-            container_name = f"vps-{user_id}-{next_container_id(user_id)}"
-            password = generate_password()
-            ssh_port = docker_utils.next_ssh_port()
-            expires = "Never" if expiry_days is None else (datetime.utcnow() + timedelta(days=expiry_days)).isoformat()
-
-            try:
-                await create_container(container_name, ram * 1024, cpu, password, disk_gb=disk, os_image=image, ssh_port=ssh_port)
-
-                vps_data[user_id].append({
-                    "container_name": container_name,
-                    "ram": f"{ram}GB",
-                    "cpu": str(cpu),
-                    "storage": f"{disk}GB",
-                    "status": "running",
-                    "created_at": datetime.now().isoformat(),
-                    "expires": expires,
-                    "auto_renew": True,
-                    "ssh_password": password,
-                    "ssh_port": ssh_port,
-                    "os_image": image,
-                    "os_label": os_label,
-                    "shared_with": [],
-                })
-                save_data()
-
-                if ctx.guild:
-                    role = await get_or_create_vps_role(ctx.guild)
-                    if role:
-                        try:
-                            await user.add_roles(role, reason="VPS ownership granted")
-                        except discord.Forbidden:
-                            pass
-
-                e = base_embed("🚀 VPS Deployed!", f"{user.mention}'s VPS is live — SSH info sent via DM.", 0x00FF88)
-                e.add_field(name="👤 Owner", value=user.mention, inline=True)
-                e.add_field(name="🆔 VPS ID", value=f"#{display_number}", inline=True)
-                e.add_field(name="📦 Container", value=f"`{container_name}`", inline=True)
-                e.add_field(name="🖥️ OS", value=os_label, inline=True)
-                e.add_field(name="🧠 RAM", value=f"{ram} GB", inline=True)
-                e.add_field(name="⚙️ CPU", value=f"{cpu} core(s)", inline=True)
-                e.add_field(name="💾 Disk", value=f"{disk} GB", inline=True)
-                e.add_field(name="⏳ Expiry", value=expires if expires == "Never" else f"{expires[:10]} (auto-renews unless cancelled)", inline=True)
-                e.add_field(name="🎮 Manage", value="`!manage` → Start / Stop / Reinstall / SSH", inline=False)
-                await ctx.send(embed=e)
+                user_id = str(user.id)
+                vps_data.setdefault(user_id, [])
+                display_number = len(vps_data[user_id]) + 1
+                container_name = f"vps-{user_id}-{next_container_id(user_id)}"
+                password = generate_password()
+                ssh_port = docker_utils.next_ssh_port(node=node_name)
+                expires = "Never" if expiry_days is None else (datetime.utcnow() + timedelta(days=expiry_days)).isoformat()
 
                 try:
-                    methods = await get_ssh_access(container_name)
-                    dm = base_embed("🎉 Your VPS is Ready!", "Connect using the info below.", 0x5865F2)
-                    dm.add_field(name="🆔 VPS ID", value=f"#{display_number}", inline=True)
-                    dm.add_field(name="🖥️ OS", value=os_label, inline=True)
-                    dm.add_field(name="🧠 RAM", value=f"{ram} GB", inline=True)
-                    dm.add_field(name="⚙️ CPU", value=f"{cpu} core(s)", inline=True)
-                    dm.add_field(name="🔑 SSH (classic)", value=f"```{docker_utils.classic_ssh_command(ssh_port)}```\nPassword: ```{password}```", inline=False)
-                    if "sshx" in methods:
-                        dm.add_field(name="🔗 SSHX (browser link)", value=f"```{methods['sshx']}```", inline=False)
-                    dm.add_field(name="🎮 Manage", value="`!manage` in the server", inline=False)
-                    await user.send(embed=dm)
-                except discord.Forbidden:
-                    pass
+                    await create_container(
+                        container_name, ram * 1024, cpu, password,
+                        disk_gb=disk, os_image=image, ssh_port=ssh_port, node=node_name,
+                    )
 
-            except Exception as e:
-                await ctx.send(embed=error_embed("Creation Failed", str(e)))
+                    vps_data[user_id].append({
+                        "node": node_name,
+                        "container_name": container_name,
+                        "ram": f"{ram}GB",
+                        "cpu": str(cpu),
+                        "storage": f"{disk}GB",
+                        "status": "running",
+                        "created_at": datetime.now().isoformat(),
+                        "expires": expires,
+                        "auto_renew": True,
+                        "ssh_password": password,
+                        "ssh_port": ssh_port,
+                        "os_image": image,
+                        "os_label": os_label,
+                        "shared_with": [],
+                    })
+                    save_data()
 
-        await interaction.response.edit_message(
-            embed=info_embed("Choose Expiry", f"Pick an expiry for {user.mention}'s VPS:"),
-            view=ExpiryPickerView(ctx.author.id, on_expiry_picked),
+                    if ctx.guild:
+                        role = await get_or_create_vps_role(ctx.guild)
+                        if role:
+                            try:
+                                await user.add_roles(role, reason="VPS ownership granted")
+                            except discord.Forbidden:
+                                pass
+
+                    e = base_embed("🚀 VPS Deployed!", f"{user.mention}'s VPS is live on **`{node_name}`** — SSH info sent via DM.", 0x00FF88)
+                    e.add_field(name="👤 Owner", value=user.mention, inline=True)
+                    e.add_field(name="🖥️ Node", value=f"`{node_name}`", inline=True)
+                    e.add_field(name="🆔 VPS ID", value=f"#{display_number}", inline=True)
+                    e.add_field(name="📦 Container", value=f"`{container_name}`", inline=True)
+                    e.add_field(name="💿 OS", value=os_label, inline=True)
+                    e.add_field(name="🧠 RAM", value=f"{ram} GB", inline=True)
+                    e.add_field(name="⚙️ CPU", value=f"{cpu} core(s)", inline=True)
+                    e.add_field(name="💾 Disk", value=f"{disk} GB", inline=True)
+                    e.add_field(name="⏳ Expiry", value=expires if expires == "Never" else f"{expires[:10]}", inline=True)
+                    e.add_field(name="🎮 Manage", value="`!manage` → Start / Stop / Reinstall / SSH", inline=False)
+                    await ctx.send(embed=e)
+
+                    try:
+                        methods = await get_ssh_access(container_name, node=node_name)
+                        dm = base_embed("🎉 Your VPS is Ready!", "Connect using the info below.", 0x5865F2)
+                        dm.add_field(name="🖥️ Node", value=f"`{node_name}`", inline=True)
+                        dm.add_field(name="🆔 VPS ID", value=f"#{display_number}", inline=True)
+                        dm.add_field(name="💿 OS", value=os_label, inline=True)
+                        dm.add_field(name="🧠 RAM", value=f"{ram} GB", inline=True)
+                        dm.add_field(name="⚙️ CPU", value=f"{cpu} core(s)", inline=True)
+                        dm.add_field(name="🔑 SSH (classic)", value=f"```{docker_utils.classic_ssh_command(ssh_port, node=node_name)}```\nPassword: ```{password}```", inline=False)
+                        if "sshx" in methods:
+                            dm.add_field(name="🔗 SSHX (browser link)", value=f"```{methods['sshx']}```", inline=False)
+                        dm.add_field(name="🎮 Manage", value="`!manage` in the server", inline=False)
+                        await user.send(embed=dm)
+                    except discord.Forbidden:
+                        pass
+
+                except Exception as e:
+                    await ctx.send(embed=error_embed("Creation Failed", str(e)))
+
+            await os_interaction.response.edit_message(
+                embed=info_embed("Choose Expiry", f"Node: **`{node_name}`** | OS: **{os_label}**\nPick an expiry for {user.mention}'s VPS:"),
+                view=ExpiryPickerView(ctx.author.id, on_expiry_picked),
+            )
+
+        await node_interaction.response.edit_message(
+            embed=info_embed("Choose an OS", f"Selected Node: **`{node_name}`**\nPick the OS to install for {user.mention}'s VPS:"),
+            view=OSPickerView(ctx.author.id, on_os_picked),
         )
 
-    await ctx.send(embed=info_embed("Choose an OS", f"Pick the OS to install for {user.mention}'s VPS:"), view=OSPickerView(ctx.author.id, on_os_picked))
+    await prompt_node_selection(
+        ctx,
+        "Choose a Node",
+        f"Select which Node to deploy {user.mention}'s VPS (`{ram}GB` RAM / `{cpu}` CPU) on:",
+        on_node_picked,
+    )
 
 
 @bot.command(name="manage")
 async def manage_vps(ctx, user: discord.Member = None):
-    """!manage [@user] — manage your VPS, or (admin only) another user's"""
-    if user:
-        if not is_admin_id(ctx.author.id):
-            await ctx.send(embed=error_embed("Access Denied", "Only admins can manage another user's VPS."))
-            return
-        vps_list = vps_data.get(str(user.id), [])
-        if not vps_list:
+    """!manage [@user] — asks which Node (if on multiple nodes) or shows all your VPSs."""
+    target = user if user else ctx.author
+    if user and not is_admin_id(ctx.author.id):
+        await ctx.send(embed=error_embed("Access Denied", "Only admins can manage another user's VPS."))
+        return
+
+    vps_list = vps_data.get(str(target.id), [])
+    if not vps_list:
+        if user:
             await ctx.send(embed=error_embed("No VPS Found", f"{user.mention} doesn't have any VPS."))
-            return
-        view = ManageView(ctx.author.id, user.id, vps_list, is_admin_view=True)
-        await ctx.send(embed=view.embed(), view=view)
-    else:
-        vps_list = vps_data.get(str(ctx.author.id), [])
-        if not vps_list:
+        else:
             e = error_embed("No VPS Found", "You don't have any VPS yet.")
             e.add_field(name="Quick Actions", value="`!plans` — view plans\n`!buywc <plan> <processor>` — purchase", inline=False)
             await ctx.send(embed=e)
-            return
-        view = ManageView(ctx.author.id, ctx.author.id, vps_list)
+        return
+
+    # If the user has VPSs across multiple nodes (or admin wants to pick by node first)
+    user_nodes = sorted({v.get("node", get_default_node()) for v in vps_list})
+    if len(user_nodes) > 1:
+        options = [discord.SelectOption(label="🌐 All Nodes", description=f"Show all {len(vps_list)} VPSs", value="__ALL__")]
+        for n_name in user_nodes:
+            c = sum(1 for v in vps_list if v.get("node") == n_name)
+            options.append(discord.SelectOption(label=f"🖥️ {n_name}", description=f"{c} VPS(s) on this node", value=n_name))
+
+        class ManageNodeFilterView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=120)
+                sel = discord.ui.Select(placeholder="Select which Node to manage...", options=options)
+                sel.callback = self._picked
+                self.add_item(sel)
+
+            async def _picked(self, interaction: discord.Interaction):
+                if str(interaction.user.id) != str(ctx.author.id):
+                    await interaction.response.send_message(embed=error_embed("Access Denied", "Not your menu."), ephemeral=True)
+                    return
+                chosen = interaction.data["values"][0]
+                filtered = vps_list if chosen == "__ALL__" else [v for v in vps_list if v.get("node") == chosen]
+                view = ManageView(ctx.author.id, target.id, filtered, is_admin_view=bool(user))
+                await interaction.response.edit_message(embed=view.embed(), view=view)
+
+        await ctx.send(
+            embed=info_embed("Select Node to Manage", f"{target.mention} has VPS instances across **{len(user_nodes)}** nodes. Pick a node:"),
+            view=ManageNodeFilterView(),
+        )
+    else:
+        view = ManageView(ctx.author.id, target.id, vps_list, is_admin_view=bool(user))
         await ctx.send(embed=view.embed(), view=view)
 
 
 @bot.command(name="delete-vps")
 @is_admin()
-async def delete_vps(ctx, user: discord.Member, vps_number: int, *, reason: str = "No reason given"):
-    """!delete-vps @user <#> [reason] — delete a user's VPS (admin only)"""
+async def delete_vps(ctx, user: discord.Member, vps_number: int = None, *, reason: str = "No reason given"):
+    """!delete-vps @user [#] [reason] — delete a user's VPS on its node (admin only)"""
     user_id = str(user.id)
     vps_list = vps_data.get(user_id, [])
-    if not vps_list or not (1 <= vps_number <= len(vps_list)):
-        await ctx.send(embed=error_embed("Invalid VPS", "Invalid VPS number, or user has no VPS."))
+    if not vps_list:
+        await ctx.send(embed=error_embed("No VPS", f"{user.mention} has no VPS."))
         return
 
-    vps = vps_list[vps_number - 1]
-    container = vps["container_name"]
-    await ctx.send(embed=info_embed("Deleting VPS", f"Removing VPS #{vps_number}..."))
-
-    try:
+    async def _perform_delete(vps_obj, reply_target):
+        container = vps_obj["container_name"]
+        node_name = vps_obj.get("node", get_default_node())
         try:
-            await run_docker(f"docker stop {container}")
-        except Exception:
-            pass
-        await run_docker(f"docker rm -f {container}")
-        del vps_list[vps_number - 1]
-        if not vps_list:
-            del vps_data[user_id]
-            if ctx.guild:
-                role = await get_or_create_vps_role(ctx.guild)
-                if role and role in user.roles:
-                    try:
-                        await user.remove_roles(role, reason="No VPS ownership left")
-                    except discord.Forbidden:
-                        pass
-        save_data()
+            try:
+                await run_docker(f"docker stop {container}", node=node_name)
+            except Exception:
+                pass
+            await run_docker(f"docker rm -f {container}", node=node_name)
+            if vps_obj in vps_list:
+                vps_list.remove(vps_obj)
+            if not vps_list:
+                vps_data.pop(user_id, None)
+                if ctx.guild:
+                    role = await get_or_create_vps_role(ctx.guild)
+                    if role and role in user.roles:
+                        try:
+                            await user.remove_roles(role, reason="No VPS ownership left")
+                        except discord.Forbidden:
+                            pass
+            save_data()
 
-        e = success_embed("VPS Deleted")
-        e.add_field(name="Owner", value=user.mention, inline=True)
-        e.add_field(name="VPS ID", value=f"#{vps_number}", inline=True)
-        e.add_field(name="Container", value=f"`{container}`", inline=True)
-        e.add_field(name="Reason", value=reason, inline=False)
-        await ctx.send(embed=e)
-    except Exception as e:
-        await ctx.send(embed=error_embed("Deletion Failed", str(e)))
+            e = success_embed("VPS Deleted")
+            e.add_field(name="Owner", value=user.mention, inline=True)
+            e.add_field(name="Node", value=f"`{node_name}`", inline=True)
+            e.add_field(name="Container", value=f"`{container}`", inline=True)
+            e.add_field(name="Reason", value=reason, inline=False)
+            await reply_target(embed=e)
+        except Exception as e:
+            await reply_target(embed=error_embed("Deletion Failed", str(e)))
+
+    if vps_number is not None:
+        if not (1 <= vps_number <= len(vps_list)):
+            await ctx.send(embed=error_embed("Invalid VPS", f"Invalid VPS number (user has {len(vps_list)})."))
+            return
+        target_vps = vps_list[vps_number - 1]
+        await ctx.send(embed=info_embed("Deleting VPS", f"Removing `{target_vps['container_name']}` from node **`{target_vps.get('node')}`**..."))
+        await _perform_delete(target_vps, ctx.send)
+        return
+
+    # If no vps_number given, let admin pick the Node & VPS via dropdown
+    options = [
+        discord.SelectOption(
+            label=f"VPS #{i + 1} — {v['container_name']} [{v.get('node', '?')}]"[:100],
+            description=f"Node: {v.get('node', '?')} | RAM: {v.get('ram')} | Status: {v.get('status')}",
+            value=str(i),
+        )
+        for i, v in enumerate(vps_list[:25])
+    ]
+
+    class DeletePickerView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=120)
+            sel = discord.ui.Select(placeholder="Select VPS & Node to delete...", options=options)
+            sel.callback = self._picked
+            self.add_item(sel)
+
+        async def _picked(self, interaction: discord.Interaction):
+            if str(interaction.user.id) != str(ctx.author.id):
+                await interaction.response.send_message(embed=error_embed("Access Denied", "Not your command."), ephemeral=True)
+                return
+            idx = int(interaction.data["values"][0])
+            target_vps = vps_list[idx]
+            await interaction.response.edit_message(
+                embed=info_embed("Deleting VPS", f"Removing `{target_vps['container_name']}` from node **`{target_vps.get('node')}`**..."),
+                view=None,
+            )
+            await _perform_delete(target_vps, interaction.followup.send)
+
+    await ctx.send(embed=info_embed("Select VPS to Delete", f"Choose which of {user.mention}'s VPSs to delete:"), view=DeletePickerView())
 
 
 @bot.command(name="manage-shared")
@@ -293,7 +516,6 @@ async def manage_shared_vps(ctx, owner: discord.Member, vps_number: int):
 
 @bot.command(name="share-user")
 async def share_user(ctx, target: discord.Member, vps_number: int):
-    """!share-user @user <#> — share your VPS with another user"""
     user_id = str(ctx.author.id)
     vps_list = vps_data.get(user_id, [])
     if not vps_list or not (1 <= vps_number <= len(vps_list)):
@@ -306,11 +528,11 @@ async def share_user(ctx, target: discord.Member, vps_number: int):
         return
     vps["shared_with"].append(str(target.id))
     save_data()
-    await ctx.send(embed=success_embed("VPS Shared", f"VPS #{vps_number} shared with {target.mention}."))
+    await ctx.send(embed=success_embed("VPS Shared", f"VPS #{vps_number} (`{vps.get('node')}`) shared with {target.mention}."))
     try:
         await target.send(embed=info_embed(
             "VPS Access Granted",
-            f"You now have access to {ctx.author.mention}'s VPS #{vps_number}. "
+            f"You now have access to {ctx.author.mention}'s VPS #{vps_number} on node `{vps.get('node')}`. "
             f"Use `!manage-shared {ctx.author.mention} {vps_number}`.",
         ))
     except discord.Forbidden:
@@ -319,7 +541,6 @@ async def share_user(ctx, target: discord.Member, vps_number: int):
 
 @bot.command(name="share-ruser")
 async def revoke_share(ctx, target: discord.Member, vps_number: int):
-    """!share-ruser @user <#> — revoke a user's shared access"""
     user_id = str(ctx.author.id)
     vps_list = vps_data.get(user_id, [])
     if not vps_list or not (1 <= vps_number <= len(vps_list)):
@@ -346,6 +567,7 @@ async def show_plans(ctx):
                   f"**Intel:** {p['price']['Intel']} cr | **AMD:** {p['price']['AMD']} cr",
             inline=True,
         )
+    e.add_field(name="Available Nodes", value=", ".join(f"`{n}`" for n in nodes_data.keys()), inline=False)
     e.add_field(name="How to Buy", value="`!buywc <plan> <Intel/AMD>`\n`!buyc` for payment info", inline=False)
     await ctx.send(embed=e)
 
@@ -366,7 +588,7 @@ async def buy_credits(ctx):
 
 @bot.command(name="buywc")
 async def buy_with_credits(ctx, plan: str, processor: str = "Intel"):
-    """!buywc <plan> <Intel/AMD> — purchase a VPS with credits"""
+    """!buywc <plan> <Intel/AMD> — asks which Node and OS to deploy on."""
     plan = plan.capitalize()
     if plan not in PLANS:
         await ctx.send(embed=error_embed("Invalid Plan", "Available: " + ", ".join(PLANS)))
@@ -382,71 +604,95 @@ async def buy_with_credits(ctx, plan: str, processor: str = "Intel"):
         await ctx.send(embed=error_embed("Insufficient Credits", f"Need {cost}, you have {user_data[user_id]['credits']}."))
         return
 
-    async def on_os_picked(interaction, image, os_label):
-        await interaction.response.edit_message(embed=info_embed("Processing Purchase", f"Deploying {plan} VPS on **{os_label}**..."), view=None)
+    async def on_node_picked(node_interaction, node_name):
+        async def on_os_picked(os_interaction, image, os_label):
+            if user_data.get(user_id, {}).get("credits", 0) < cost:
+                await os_interaction.response.edit_message(
+                    embed=error_embed("Insufficient Credits", f"Need {cost}, you have {user_data[user_id]['credits']}."),
+                    view=None,
+                )
+                return
 
-        user_data[user_id]["credits"] -= cost
-        vps_data.setdefault(user_id, [])
-        display_number = len(vps_data[user_id]) + 1
-        container_name = f"vps-{user_id}-{next_container_id(user_id)}"
-        ram_str = PLANS[plan]["ram"]
-        cpu_str = PLANS[plan]["cpu"]
-        password = generate_password()
-        ssh_port = docker_utils.next_ssh_port()
-
-        try:
-            await create_container(container_name, int(ram_str.replace("GB", "")) * 1024, cpu_str, password, os_image=image, ssh_port=ssh_port)
-
-            vps_data[user_id].append({
-                "plan": plan,
-                "container_name": container_name,
-                "ram": ram_str,
-                "cpu": cpu_str,
-                "storage": PLANS[plan]["storage"],
-                "status": "running",
-                "created_at": datetime.now().isoformat(),
-                "processor": processor,
-                "expires": "Never",
-                "ssh_password": password,
-                "ssh_port": ssh_port,
-                "os_image": image,
-                "os_label": os_label,
-                "shared_with": [],
-            })
+            user_data[user_id]["credits"] -= cost
             save_data()
 
-            if ctx.guild:
-                role = await get_or_create_vps_role(ctx.guild)
-                if role:
-                    try:
-                        await ctx.author.add_roles(role, reason="VPS purchase")
-                    except discord.Forbidden:
-                        pass
+            await os_interaction.response.edit_message(
+                embed=info_embed("Processing Purchase", f"Deploying {plan} VPS on Node **`{node_name}`** (**{os_label}**)..."),
+                view=None,
+            )
 
-            e = success_embed("VPS Purchased")
-            e.add_field(name="Plan", value=f"{plan} ({processor})", inline=True)
-            e.add_field(name="OS", value=os_label, inline=True)
-            e.add_field(name="VPS ID", value=f"#{display_number}", inline=True)
-            e.add_field(name="Cost", value=f"{cost} credits", inline=True)
-            await ctx.send(embed=e)
+            vps_data.setdefault(user_id, [])
+            display_number = len(vps_data[user_id]) + 1
+            container_name = f"vps-{user_id}-{next_container_id(user_id)}"
+            ram_str = PLANS[plan]["ram"]
+            cpu_str = PLANS[plan]["cpu"]
+            password = generate_password()
+            ssh_port = docker_utils.next_ssh_port(node=node_name)
 
             try:
-                methods = await get_ssh_access(container_name)
-                dm = base_embed("🎉 Your VPS is Ready!", "Connect using the info below.", 0x5865F2)
-                dm.add_field(name="🔑 SSH (classic)", value=f"```{docker_utils.classic_ssh_command(ssh_port)}```\nPassword: ```{password}```", inline=False)
-                if "sshx" in methods:
-                    dm.add_field(name="🔗 SSHX (browser link)", value=f"```{methods['sshx']}```", inline=False)
-                dm.add_field(name="🎮 Manage", value="`!manage` in the server", inline=False)
-                await ctx.author.send(embed=dm)
-            except discord.Forbidden:
-                pass
+                await create_container(
+                    container_name, int(ram_str.replace("GB", "")) * 1024, cpu_str, password,
+                    os_image=image, ssh_port=ssh_port, node=node_name,
+                )
 
-        except Exception as e:
-            user_data[user_id]["credits"] += cost  # refund on failure
-            save_data()
-            await ctx.send(embed=error_embed("Purchase Failed", f"{e}\n\nYour credits were refunded."))
+                vps_data[user_id].append({
+                    "node": node_name,
+                    "plan": plan,
+                    "container_name": container_name,
+                    "ram": ram_str,
+                    "cpu": cpu_str,
+                    "storage": PLANS[plan]["storage"],
+                    "status": "running",
+                    "created_at": datetime.now().isoformat(),
+                    "processor": processor,
+                    "expires": "Never",
+                    "ssh_password": password,
+                    "ssh_port": ssh_port,
+                    "os_image": image,
+                    "os_label": os_label,
+                    "shared_with": [],
+                })
+                save_data()
 
-    await ctx.send(embed=info_embed("Choose an OS", f"Pick the OS for your {plan} VPS:"), view=OSPickerView(ctx.author.id, on_os_picked))
+                if ctx.guild:
+                    role = await get_or_create_vps_role(ctx.guild)
+                    if role:
+                        try:
+                            await ctx.author.add_roles(role, reason="VPS purchase")
+                        except discord.Forbidden:
+                            pass
+
+                e = success_embed("VPS Purchased")
+                e.add_field(name="Node", value=f"`{node_name}`", inline=True)
+                e.add_field(name="Plan", value=f"{plan} ({processor})", inline=True)
+                e.add_field(name="OS", value=os_label, inline=True)
+                e.add_field(name="VPS ID", value=f"#{display_number}", inline=True)
+                e.add_field(name="Cost", value=f"{cost} credits", inline=True)
+                await ctx.send(embed=e)
+
+                try:
+                    methods = await get_ssh_access(container_name, node=node_name)
+                    dm = base_embed("🎉 Your VPS is Ready!", "Connect using the info below.", 0x5865F2)
+                    dm.add_field(name="🖥️ Node", value=f"`{node_name}`", inline=True)
+                    dm.add_field(name="🔑 SSH (classic)", value=f"```{docker_utils.classic_ssh_command(ssh_port, node=node_name)}```\nPassword: ```{password}```", inline=False)
+                    if "sshx" in methods:
+                        dm.add_field(name="🔗 SSHX (browser link)", value=f"```{methods['sshx']}```", inline=False)
+                    dm.add_field(name="🎮 Manage", value="`!manage` in the server", inline=False)
+                    await ctx.author.send(embed=dm)
+                except discord.Forbidden:
+                    pass
+
+            except Exception as e:
+                user_data[user_id]["credits"] += cost
+                save_data()
+                await ctx.send(embed=error_embed("Purchase Failed", f"{e}\n\nYour credits were refunded."))
+
+        await node_interaction.response.edit_message(
+            embed=info_embed("Choose an OS", f"Selected Node: **`{node_name}`**\nPick the OS for your {plan} VPS:"),
+            view=OSPickerView(ctx.author.id, on_os_picked),
+        )
+
+    await prompt_node_selection(ctx, "Choose a Node", f"Select which Node to deploy your **{plan}** VPS on:", on_node_picked)
 
 
 @bot.command(name="credits")
@@ -511,14 +757,19 @@ async def admin_add_credits(ctx, user: discord.Member, amount: int):
 @bot.command(name="adminrc")
 @is_admin()
 async def admin_remove_credits(ctx, user: discord.Member, amount: str):
-    """Use 'all' to zero out a user's balance."""
     user_id = str(user.id)
     user_data.setdefault(user_id, {"credits": 0})
     if amount.lower() == "all":
         removed = user_data[user_id]["credits"]
         user_data[user_id]["credits"] = 0
     else:
-        removed = int(amount)
+        try:
+            removed = int(amount)
+            if removed <= 0:
+                raise ValueError
+        except ValueError:
+            await ctx.send(embed=error_embed("Invalid Amount", "Enter a positive integer or `all`."))
+            return
         user_data[user_id]["credits"] = max(0, user_data[user_id]["credits"] - removed)
     save_data()
     await ctx.send(embed=success_embed("Credits Removed", f"Removed {removed} from {user.mention}. New balance: {user_data[user_id]['credits']}"))
@@ -540,8 +791,9 @@ async def my_info(ctx):
         for i, v in enumerate(vps_list):
             nickname = v.get("nickname", f"VPS {i + 1}")
             icon = "🟢" if v.get("status") == "running" else "🔴"
+            node_tag = v.get("node", get_default_node())
             note = f" — _{v['note']}_" if v.get("note") else ""
-            lines.append(f"{icon} **{nickname}** (`{v['container_name']}`){note}")
+            lines.append(f"{icon} **{nickname}** (`{v['container_name']}` on `{node_tag}`){note}")
         e.add_field(name="🖥️ Your VPS", value="\n".join(lines), inline=False)
     else:
         e.add_field(name="🖥️ Your VPS", value="No VPS yet — try `!buywc`.", inline=False)
@@ -581,15 +833,16 @@ async def ping_vps(ctx, vps_number: int):
         return
     vps = vps_list[vps_number - 1]
     container = vps["container_name"]
-    msg = await ctx.send(embed=info_embed("Pinging...", f"Checking `{container}`..."))
+    node_name = vps.get("node", get_default_node())
+    msg = await ctx.send(embed=info_embed("Pinging...", f"Checking `{container}` on node **`{node_name}`**..."))
     start = time.time()
     try:
-        out = await run_docker(f"docker inspect --format={{{{.State.Running}}}} {container}", timeout=10)
+        out = await run_docker(f"docker inspect --format={{{{.State.Running}}}} {container}", timeout=12, node=node_name)
         elapsed_ms = int((time.time() - start) * 1000)
         if out.strip() == "true":
-            await msg.edit(embed=success_embed("🏓 Pong!", f"Alive — response `{elapsed_ms}ms`"))
+            await msg.edit(embed=success_embed("🏓 Pong!", f"Alive on **`{node_name}`** — response `{elapsed_ms}ms`"))
         else:
-            await msg.edit(embed=error_embed("💀 No Response", "Container is not running."))
+            await msg.edit(embed=error_embed("💀 No Response", f"Container is not running on `{node_name}`."))
     except Exception as e:
         await msg.edit(embed=error_embed("Ping Failed", str(e)))
 
@@ -600,14 +853,16 @@ async def uptime_vps(ctx, vps_number: int):
     if not vps_list or not (1 <= vps_number <= len(vps_list)):
         await ctx.send(embed=error_embed("Invalid VPS", "VPS not found."))
         return
-    container = vps_list[vps_number - 1]["container_name"]
+    vps = vps_list[vps_number - 1]
+    container = vps["container_name"]
+    node_name = vps.get("node", get_default_node())
     try:
-        started_at_str = await run_docker(f"docker inspect --format={{{{.State.StartedAt}}}} {container}", timeout=10)
+        started_at_str = await run_docker(f"docker inspect --format={{{{.State.StartedAt}}}} {container}", timeout=12, node=node_name)
         started_at = datetime.fromisoformat(started_at_str[:19])
         delta = datetime.utcnow() - started_at
         hours, rem = divmod(delta.seconds, 3600)
         minutes, seconds = divmod(rem, 60)
-        e = success_embed(f"⏱️ Uptime — {container}", f"```{delta.days}d {hours}h {minutes}m {seconds}s```")
+        e = success_embed(f"⏱️ Uptime — {container} ({node_name})", f"```{delta.days}d {hours}h {minutes}m {seconds}s```")
         e.add_field(name="Started At", value=f"`{started_at_str[:19]} UTC`", inline=False)
         await ctx.send(embed=e)
     except Exception as e:
@@ -621,635 +876,6 @@ async def bot_status(ctx):
     minutes, _ = divmod(rem, 60)
     total = sum(len(v) for v in vps_data.values())
     running = sum(1 for vl in vps_data.values() for v in vl if v.get("status") == "running")
-    e = base_embed("🤖 Bot Status", "ApexHosting VPS Manager", 0x00FF88)
+    e = base_embed("🤖 Bot Status", "ApexHosting Multi-Node VPS Manager", 0x00FF88)
     e.add_field(name="⏱️ Uptime", value=f"{delta.days}d {hours}h {minutes}m", inline=True)
-    e.add_field(name="🖥️ Total VPS", value=f"{total} ({running} running)", inline=True)
-    e.add_field(name="👥 Users", value=str(len(user_data)), inline=True)
-    e.add_field(name="🔧 Maintenance", value="🔴 ON" if config.maintenance_mode else "🟢 OFF", inline=True)
-    e.add_field(name="📡 Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
-    await ctx.send(embed=e)
-
-
-# ─── Admin tools ────────────────────────────────────────────────────────────
-
-@bot.command(name="list-all")
-@is_admin()
-async def list_all_vps(ctx):
-    total = running = 0
-    summary, details = [], []
-    for user_id, vps_list in vps_data.items():
-        try:
-            user = await bot.fetch_user(int(user_id))
-            name = user.name
-        except Exception:
-            name = f"Unknown ({user_id})"
-        r = sum(1 for v in vps_list if v.get("status") == "running")
-        total += len(vps_list)
-        running += r
-        summary.append(f"**{name}** — {len(vps_list)} VPS ({r} running)")
-        for i, v in enumerate(vps_list):
-            icon = "🟢" if v.get("status") == "running" else "🔴"
-            details.append(f"{icon} {name} — VPS {i + 1}: `{v['container_name']}` — {v.get('status', '?').upper()}")
-
-    e = base_embed("All VPS Information", "")
-    e.add_field(name="System Overview", value=f"Users: {len(vps_data)}\nTotal VPS: {total}\nRunning: {running}\nStopped: {total - running}", inline=False)
-    if summary:
-        e.add_field(name="User Summary", value="\n".join(summary[:10]), inline=False)
-    for i in range(0, min(len(details), 30), 15):
-        chunk = details[i:i + 15]
-        e.add_field(name=f"Deployments ({i + 1}-{min(i + 15, len(details))})", value="\n".join(chunk), inline=False)
-    await ctx.send(embed=e)
-
-
-@bot.command(name="userinfo")
-@is_admin()
-async def user_info(ctx, user: discord.Member):
-    user_id = str(user.id)
-    credits = user_data.get(user_id, {}).get("credits", 0)
-    e = base_embed(f"👤 User Info — {user.name}", "")
-    e.add_field(name="User", value=f"{user.mention}\nID: {user.id}", inline=False)
-    e.add_field(name="💰 Credits", value=str(credits), inline=True)
-    e.add_field(name="🛡️ Admin", value="Yes" if is_admin_id(user_id) else "No", inline=True)
-    vps_list = vps_data.get(user_id, [])
-    if vps_list:
-        e.add_field(name="🖥️ VPS", value="\n".join(
-            f"VPS {i + 1}: `{v['container_name']}` — {v.get('status', '?').upper()}" for i, v in enumerate(vps_list)
-        ), inline=False)
-    else:
-        e.add_field(name="🖥️ VPS", value="None", inline=False)
-    await ctx.send(embed=e)
-
-
-@bot.command(name="serverstats")
-@is_admin()
-async def server_stats(ctx):
-    total = sum(len(v) for v in vps_data.values())
-    running = sum(1 for vl in vps_data.values() for v in vl if v.get("status") == "running")
-    total_credits = sum(u.get("credits", 0) for u in user_data.values())
-    total_ram = sum(int(v["ram"].replace("GB", "")) for vl in vps_data.values() for v in vl)
-    total_cpu = sum(int(v["cpu"]) for vl in vps_data.values() for v in vl)
-    e = base_embed("📊 Server Statistics", "")
-    e.add_field(name="👥 Users", value=f"Total: {len(user_data)}\nAdmins: {len(admin_data.get('admins', []))}", inline=False)
-    e.add_field(name="🖥️ VPS", value=f"Total: {total}\nRunning: {running}\nStopped: {total - running}", inline=False)
-    e.add_field(name="💰 Economy", value=f"Total credits in circulation: {total_credits}", inline=False)
-    e.add_field(name="📈 Resources", value=f"Total RAM: {total_ram}GB\nTotal CPU: {total_cpu} cores", inline=False)
-    await ctx.send(embed=e)
-
-
-@bot.command(name="exec")
-@is_admin()
-async def execute_command(ctx, container_name: str, *, command: str):
-    await ctx.send(embed=info_embed("Executing", f"Running in `{container_name}`..."))
-    try:
-        stdout, stderr, rc = await docker_exec(container_name, command, timeout=30)
-        e = base_embed(f"Output — {container_name}", f"`{command}`")
-        if stdout:
-            e.add_field(name="📤 stdout", value=f"```\n{stdout[:1000]}\n```", inline=False)
-        if stderr:
-            e.add_field(name="⚠️ stderr", value=f"```\n{stderr[:1000]}\n```", inline=False)
-        e.add_field(name="🔄 Exit Code", value=str(rc), inline=False)
-        await ctx.send(embed=e)
-    except Exception as e:
-        await ctx.send(embed=error_embed("Execution Failed", str(e)))
-
-
-@bot.command(name="restart-vps")
-@is_admin()
-async def restart_vps(ctx, container_name: str):
-    await ctx.send(embed=info_embed("Restarting", f"Restarting `{container_name}`..."))
-    try:
-        await run_docker(f"docker restart {container_name}")
-        await asyncio.sleep(3)
-        await docker_exec(container_name, "/usr/sbin/sshd || true", timeout=10)
-        for vl in vps_data.values():
-            for v in vl:
-                if v["container_name"] == container_name:
-                    v["status"] = "running"
-        save_data()
-        await ctx.send(embed=success_embed("VPS Restarted", f"`{container_name}` restarted."))
-    except Exception as e:
-        await ctx.send(embed=error_embed("Restart Failed", str(e)))
-
-
-@bot.command(name="backup-vps")
-@is_admin()
-async def backup_vps(ctx, container_name: str):
-    snapshot = f"{container_name}-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    await ctx.send(embed=info_embed("Creating Backup", f"Committing snapshot of `{container_name}`..."))
-    try:
-        await run_docker(f"docker commit {container_name} {snapshot}")
-        await ctx.send(embed=success_embed("Backup Created", f"Image `{snapshot}` created."))
-    except Exception as e:
-        await ctx.send(embed=error_embed("Backup Failed", str(e)))
-
-
-@bot.command(name="restore-vps")
-@is_admin()
-async def restore_vps(ctx, container_name: str, snapshot_name: str):
-    """Restore a VPS from a `!backup-vps` snapshot image."""
-    found = None
-    for vl in vps_data.values():
-        for v in vl:
-            if v["container_name"] == container_name:
-                found = v
-                break
-    if not found:
-        await ctx.send(embed=error_embed("Not Found", f"No VPS data for `{container_name}`."))
-        return
-
-    await ctx.send(embed=info_embed("Restoring", f"Restoring `{container_name}` from `{snapshot_name}`..."))
-    try:
-        try:
-            await run_docker(f"docker stop {container_name}")
-        except Exception:
-            pass
-        await run_docker(f"docker rm -f {container_name}")
-        # No port mapping — this bot uses tmate for SSH, nothing is exposed on the host.
-        await run_docker(
-            f"docker run -d --name {container_name} --restart=unless-stopped {snapshot_name} sleep infinity"
-        )
-        await asyncio.sleep(2)
-        await docker_exec(container_name, "/usr/sbin/sshd || true", timeout=10)
-        found["status"] = "running"
-        save_data()
-        await ctx.send(embed=success_embed("VPS Restored", f"`{container_name}` restored from `{snapshot_name}`."))
-    except Exception as e:
-        await ctx.send(embed=error_embed("Restore Failed", str(e)))
-
-
-@bot.command(name="stop-vps-all")
-@is_admin()
-async def stop_all_vps(ctx):
-    class ConfirmView(discord.ui.View):
-        def __init__(self):
-            super().__init__(timeout=60)
-
-        @discord.ui.button(label="Stop All VPS", style=discord.ButtonStyle.danger)
-        async def confirm(self, interaction: discord.Interaction, _button):
-            await interaction.response.defer()
-            stopped, errors = 0, []
-            for vl in vps_data.values():
-                for v in vl:
-                    if v.get("status") == "running":
-                        try:
-                            await run_docker(f"docker stop {v['container_name']}")
-                            v["status"] = "stopped"
-                            stopped += 1
-                        except Exception as e:
-                            errors.append(str(e))
-            save_data()
-            e = success_embed("All VPS Stopped", f"Stopped {stopped} container(s).")
-            if errors:
-                e.add_field(name="Errors", value="\n".join(errors[:5]), inline=False)
-            await interaction.followup.send(embed=e)
-
-        @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-        async def cancel(self, interaction: discord.Interaction, _button):
-            await interaction.response.edit_message(embed=info_embed("Cancelled", "No changes made."), view=None)
-
-    await ctx.send(embed=warning_embed("Stop All VPS", "⚠️ This will stop every running VPS. Continue?"), view=ConfirmView())
-
-
-@bot.command(name="cpu-monitor")
-@is_admin()
-async def cpu_monitor_control(ctx, action: str = "status"):
-    action = action.lower()
-    if action == "status":
-        e = base_embed("CPU Monitor Status", f"Status: **{'Active' if config.cpu_monitor_active else 'Inactive'}**")
-        e.add_field(name="Threshold", value=f"{CPU_THRESHOLD}%", inline=True)
-        e.add_field(name="Check Interval", value=f"{CPU_CHECK_INTERVAL}s", inline=True)
-        await ctx.send(embed=e)
-    elif action == "enable":
-        config.cpu_monitor_active = True
-        await ctx.send(embed=success_embed("CPU Monitor Enabled"))
-    elif action == "disable":
-        config.cpu_monitor_active = False
-        await ctx.send(embed=warning_embed("CPU Monitor Disabled"))
-    else:
-        await ctx.send(embed=error_embed("Invalid Action", "Use: `!cpu-monitor <status|enable|disable>`"))
-
-
-@bot.command(name="announce")
-@is_admin()
-async def announce(ctx, *, message: str):
-    sent = failed = 0
-    e = base_embed("📢 Announcement", message, 0xFFAA00)
-    e.add_field(name="From", value=f"ApexHosting Team ({ctx.author.mention})", inline=False)
-    status = await ctx.send(embed=info_embed("Sending", "Broadcasting to all VPS owners..."))
-    for uid in vps_data.keys():
-        try:
-            user = await bot.fetch_user(int(uid))
-            await user.send(embed=e)
-            sent += 1
-            await asyncio.sleep(0.5)
-        except Exception:
-            failed += 1
-    await status.edit(embed=success_embed("Announcement Sent", f"✅ Delivered: {sent}\n❌ Failed: {failed}"))
-
-
-@bot.command(name="maintenance")
-@is_admin()
-async def maintenance_toggle(ctx, mode: str):
-    mode = mode.lower()
-    if mode == "on":
-        config.maintenance_mode = True
-        await bot.change_presence(status=discord.Status.idle, activity=discord.Activity(type=discord.ActivityType.watching, name="🔴 Under Maintenance"))
-        await ctx.send(embed=warning_embed("🔴 Maintenance Mode ON", "Non-admin commands are now blocked."))
-    elif mode == "off":
-        config.maintenance_mode = False
-        await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name="ApexHosting | VPS Manager"))
-        await ctx.send(embed=success_embed("🟢 Maintenance Mode OFF", "Bot is back to normal."))
-    else:
-        await ctx.send(embed=error_embed("Invalid", "Use: `!maintenance on` or `!maintenance off`"))
-
-
-@bot.command(name="admin-add")
-@is_main_admin()
-async def admin_add(ctx, user: discord.Member):
-    user_id = str(user.id)
-    admin_data.setdefault("admins", [])
-    if user_id not in admin_data["admins"]:
-        admin_data["admins"].append(user_id)
-        save_data()
-    await ctx.send(embed=success_embed("Admin Added", f"{user.mention} is now an admin."))
-
-
-@bot.command(name="admin-remove")
-@is_main_admin()
-async def admin_remove(ctx, user: discord.Member):
-    user_id = str(user.id)
-    admins = admin_data.setdefault("admins", [])
-    if user_id in admins:
-        admins.remove(user_id)
-        save_data()
-    await ctx.send(embed=success_embed("Admin Removed", f"{user.mention} is no longer an admin."))
-
-
-@bot.command(name="admin-list")
-@is_main_admin()
-async def admin_list(ctx):
-    lines = []
-    for aid in admin_data.get("admins", []):
-        try:
-            u = await bot.fetch_user(int(aid))
-            lines.append(f"• {u.mention} ({u.name})")
-        except Exception:
-            lines.append(f"• Unknown ({aid})")
-    await ctx.send(embed=info_embed("Admin List", "\n".join(lines) if lines else "No admins"))
-
-
-# ─── Invite rewards (no money — invite people to unlock a bigger VPS) ─────
-
-@bot.command(name="myinvites")
-async def my_invites(ctx):
-    data = invite_data.get(str(ctx.author.id), {"invites": 0, "claimed_tier": None})
-    n = data["invites"]
-    tier = _tier_for_invites(n)
-    next_threshold = next((t for t, _ in config.INVITE_TIERS if t > n), None)
-    e = base_embed("🚀 VPS Invite Rewards", f"{ctx.author.mention}'s progress", 0x00FF88)
-    e.add_field(name="Invites", value=str(n), inline=True)
-    e.add_field(name="Unlocked Tier", value=f"{tier} invites" if tier else "None yet", inline=True)
-    e.add_field(name="Claimed", value=f"{data['claimed_tier']} invites" if data.get("claimed_tier") else "Not claimed", inline=True)
-    if next_threshold:
-        e.add_field(name="Next Tier", value=f"{next_threshold - n} more invite(s) to go", inline=False)
-    if tier and data.get("claimed_tier") != tier:
-        e.add_field(name="🎁", value="You have an unclaimed reward — run `!claimvps`!", inline=False)
-    await ctx.send(embed=e)
-
-
-@bot.command(name="claimvps")
-async def claim_vps(ctx):
-    data = invite_data.setdefault(str(ctx.author.id), {"invites": 0, "claimed_tier": None})
-    n = data["invites"]
-    tier = _tier_for_invites(n)
-    if not tier:
-        await ctx.send(embed=error_embed("Not Enough Invites", f"You need at least {config.INVITE_TIERS[0][0]} invites. You have {n}."))
-        return
-    if data.get("claimed_tier") == tier:
-        await ctx.send(embed=error_embed("Already Claimed", f"You've already claimed the {tier}-invite reward. Invite more to unlock the next tier."))
-        return
-
-    spec = dict(next(s for t, s in config.INVITE_TIERS if t == tier))
-
-    async def on_os_picked(interaction, image, os_label):
-        await interaction.response.edit_message(embed=info_embed("Deploying Reward VPS", f"Building your {tier}-invite VPS on **{os_label}**..."), view=None)
-        user_id = str(ctx.author.id)
-        vps_data.setdefault(user_id, [])
-        display_number = len(vps_data[user_id]) + 1
-        container_name = f"vps-{user_id}-{next_container_id(user_id)}"
-        password = generate_password()
-        ssh_port = docker_utils.next_ssh_port()
-        try:
-            await create_container(container_name, spec["ram"] * 1024, spec["cpu"], password, disk_gb=spec["storage"], os_image=image, ssh_port=ssh_port)
-            vps_data[user_id].append({
-                "container_name": container_name,
-                "ram": f"{spec['ram']}GB",
-                "cpu": str(spec["cpu"]),
-                "storage": f"{spec['storage']}GB",
-                "status": "running",
-                "created_at": datetime.now().isoformat(),
-                "expires": "Never",
-                "auto_renew": False,
-                "ssh_password": password,
-                "ssh_port": ssh_port,
-                "os_image": image,
-                "os_label": os_label,
-                "plan": f"Invite Reward ({tier})",
-                "shared_with": [],
-            })
-            data["claimed_tier"] = tier
-            save_data()
-
-            if ctx.guild:
-                role = await get_or_create_vps_role(ctx.guild)
-                if role:
-                    try:
-                        await ctx.author.add_roles(role, reason="VPS invite reward claimed")
-                    except discord.Forbidden:
-                        pass
-
-            e = success_embed("🎉 Reward Claimed!", f"Your {tier}-invite VPS is live.")
-            e.add_field(name="VPS ID", value=f"#{display_number}", inline=True)
-            e.add_field(name="RAM", value=f"{spec['ram']} GB", inline=True)
-            e.add_field(name="CPU", value=f"{spec['cpu']} core(s)", inline=True)
-            e.add_field(name="Storage", value=f"{spec['storage']} GB", inline=True)
-            await ctx.send(embed=e)
-
-            try:
-                methods = await get_ssh_access(container_name)
-                dm = base_embed("🎉 Your Reward VPS is Ready!", "Connect using the info below.", 0x5865F2)
-                dm.add_field(name="🔑 SSH (classic)", value=f"```{docker_utils.classic_ssh_command(ssh_port)}```\nPassword: ```{password}```", inline=False)
-                if "sshx" in methods:
-                    dm.add_field(name="🔗 SSHX (browser link)", value=f"```{methods['sshx']}```", inline=False)
-                dm.add_field(name="🎮 Manage", value="`!manage` in the server", inline=False)
-                await ctx.author.send(embed=dm)
-            except discord.Forbidden:
-                pass
-        except Exception as e:
-            await ctx.send(embed=error_embed("Deployment Failed", str(e)))
-
-    await ctx.send(embed=info_embed("Choose an OS", f"Pick the OS for your {tier}-invite reward VPS:"), view=OSPickerView(ctx.author.id, on_os_picked))
-
-
-@bot.command(name="cancel-renew")
-@is_admin()
-async def cancel_renew(ctx, user: discord.Member, vps_number: int):
-    """!cancel-renew @user <#> — stop auto-renew, it'll expire normally next cycle (admin only)"""
-    vps_list = vps_data.get(str(user.id), [])
-    if not vps_list or not (1 <= vps_number <= len(vps_list)):
-        await ctx.send(embed=error_embed("Not Found", f"{user.mention} has no VPS #{vps_number}."))
-        return
-    vps_list[vps_number - 1]["auto_renew"] = False
-    save_data()
-    await ctx.send(embed=success_embed("Auto-Renew Cancelled", f"VPS #{vps_number} will stop instead of auto-renewing at its next expiry."))
-
-
-@bot.command(name="enable-renew")
-@is_admin()
-async def enable_renew(ctx, user: discord.Member, vps_number: int):
-    """!enable-renew @user <#> — re-enable auto-renew (admin only)"""
-    vps_list = vps_data.get(str(user.id), [])
-    if not vps_list or not (1 <= vps_number <= len(vps_list)):
-        await ctx.send(embed=error_embed("Not Found", f"{user.mention} has no VPS #{vps_number}."))
-        return
-    vps_list[vps_number - 1]["auto_renew"] = True
-    save_data()
-    await ctx.send(embed=success_embed("Auto-Renew Enabled", f"VPS #{vps_number} will auto-renew by {config.RENEW_EXTEND_DAYS} days at expiry."))
-
-
-# ─── Expiry system ──────────────────────────────────────────────────────────
-
-@bot.command(name="setexpire")
-@is_admin()
-async def set_expire(ctx, user: discord.Member, vps_number: int, days: int):
-    vps_list = vps_data.get(str(user.id), [])
-    if not vps_list or not (1 <= vps_number <= len(vps_list)):
-        await ctx.send(embed=error_embed("Not Found", f"{user.mention} has no VPS #{vps_number}."))
-        return
-    exp = (datetime.utcnow() + timedelta(days=days)).isoformat()
-    vps_list[vps_number - 1]["expires"] = exp
-    save_data()
-    await ctx.send(embed=success_embed("Expiry Set", f"{user.mention}'s VPS #{vps_number} expires on `{exp[:10]}` ({days}d)."))
-    try:
-        await user.send(embed=warning_embed("⏳ VPS Expiry Set", f"Your VPS #{vps_number} expires on **{exp[:10]}**."))
-    except discord.Forbidden:
-        pass
-
-
-@bot.command(name="extendexpire")
-@is_admin()
-async def extend_expire(ctx, user: discord.Member, vps_number: int, days: int):
-    vps_list = vps_data.get(str(user.id), [])
-    if not vps_list or not (1 <= vps_number <= len(vps_list)):
-        await ctx.send(embed=error_embed("Not Found", f"{user.mention} has no VPS #{vps_number}."))
-        return
-    vps = vps_list[vps_number - 1]
-    current = vps.get("expires", "Never")
-    base = datetime.utcnow()
-    if current and current != "Never":
-        try:
-            parsed = datetime.fromisoformat(current)
-            base = max(parsed, base)
-        except Exception:
-            pass
-    new_exp = (base + timedelta(days=days)).isoformat()
-    vps["expires"] = new_exp
-    save_data()
-    await ctx.send(embed=success_embed("Expiry Extended", f"VPS #{vps_number} extended by {days}d. New expiry: `{new_exp[:10]}`"))
-    try:
-        await user.send(embed=success_embed("✅ VPS Extended", f"Your VPS #{vps_number} was extended to **{new_exp[:10]}**."))
-    except discord.Forbidden:
-        pass
-
-
-@bot.command(name="removeexpire")
-@is_admin()
-async def remove_expire(ctx, user: discord.Member, vps_number: int):
-    vps_list = vps_data.get(str(user.id), [])
-    if not vps_list or not (1 <= vps_number <= len(vps_list)):
-        await ctx.send(embed=error_embed("Not Found", f"{user.mention} has no VPS #{vps_number}."))
-        return
-    vps_list[vps_number - 1]["expires"] = "Never"
-    save_data()
-    await ctx.send(embed=success_embed("Expiry Removed", f"VPS #{vps_number} now never expires."))
-
-
-@bot.command(name="checkexpire")
-async def check_expire(ctx, user: discord.Member = None):
-    target = user if (user and is_admin_id(ctx.author.id)) else ctx.author
-    vps_list = vps_data.get(str(target.id), [])
-    if not vps_list:
-        await ctx.send(embed=error_embed("Not Found", f"{target.mention} has no VPS."))
-        return
-    e = info_embed(f"⏳ VPS Expiry — {target.display_name}", "")
-    for i, vps in enumerate(vps_list):
-        expires = vps.get("expires", "Never")
-        if expires and expires != "Never":
-            try:
-                days_left = (datetime.fromisoformat(expires) - datetime.utcnow()).days
-                if days_left < 0:
-                    status = f"❌ EXPIRED {abs(days_left)}d ago"
-                elif days_left <= 3:
-                    status = f"⚠️ Expires in {days_left}d — {expires[:10]}"
-                else:
-                    status = f"✅ Expires {expires[:10]} ({days_left}d left)"
-            except Exception:
-                status = expires
-        else:
-            status = "♾️ Never"
-        e.add_field(name=f"VPS #{i + 1} — `{vps['container_name']}`", value=status, inline=False)
-    await ctx.send(embed=e)
-
-
-@tasks.loop(hours=24)
-async def auto_expire_check():
-    now = datetime.utcnow()
-    for user_id, vps_list in list(vps_data.items()):
-        for vps in vps_list:
-            expires = vps.get("expires", "Never")
-            if not expires or expires == "Never":
-                continue
-            try:
-                days_left = (datetime.fromisoformat(expires) - now).days
-            except Exception:
-                continue
-
-            container = vps["container_name"]
-
-            try:
-                if days_left in config.EXPIRY_WARN_DAYS:
-                    u = await bot.fetch_user(int(user_id))
-
-                    async def on_renew(interaction, _vps=vps, _uid=user_id):
-                        new_exp = (datetime.utcnow() + timedelta(days=config.RENEW_EXTEND_DAYS)).isoformat()
-                        _vps["expires"] = new_exp
-                        save_data()
-                        await interaction.response.edit_message(
-                            embed=success_embed("✅ Renewed", f"`{_vps['container_name']}` extended to `{new_exp[:10]}`."),
-                            view=None,
-                        )
-
-                    e = warning_embed(
-                        "⏳ VPS Expiring Soon" if days_left > 1 else "🚨 VPS Expires Tomorrow",
-                        f"`{container}` expires in **{days_left} day{'s' if days_left != 1 else ''}** ({expires[:10]}).\n"
-                        f"Click below to renew now, or it will auto-renew by {config.RENEW_EXTEND_DAYS} days on the expiry date "
-                        f"unless an admin cancels auto-renew for it.",
-                    )
-                    await u.send(embed=e, view=RenewView(on_renew))
-
-                elif days_left < 0:
-                    u = await bot.fetch_user(int(user_id))
-                    if vps.get("auto_renew", True):
-                        new_exp = (datetime.utcnow() + timedelta(days=config.RENEW_EXTEND_DAYS)).isoformat()
-                        vps["expires"] = new_exp
-                        await u.send(embed=success_embed("🔁 Auto-Renewed", f"`{container}` was automatically renewed to `{new_exp[:10]}`."))
-                    else:
-                        if vps.get("status") == "running":
-                            try:
-                                await run_docker(f"docker stop {container}")
-                            except Exception:
-                                pass
-                            vps["status"] = "stopped"
-                        await u.send(embed=error_embed("❌ VPS Expired", f"`{container}` has expired and been stopped (auto-renew was cancelled)."))
-            except Exception:
-                continue
-    save_data()
-
-
-# ─── Help ───────────────────────────────────────────────────────────────────
-
-def build_help_pages(user_is_admin: bool, user_is_main_admin: bool):
-    pages = {}
-
-    user_embed = base_embed("👤 User Commands", "VPS management for everyone:", 0x00FF88)
-    user_embed.add_field(name="🖥️ VPS", value=(
-        "`!manage` — manage your VPS\n"
-        "`!manage @user` — (admin) manage another user's VPS\n"
-        "`!share-user @user <#>` / `!share-ruser @user <#>`\n"
-        "`!manage-shared @owner <#>`"
-    ), inline=False)
-    user_embed.add_field(name="🏷️ Tools", value=(
-        "`!rename-vps <#> <name>` · `!vps-note <#> <text>`\n"
-        "`!ping-vps <#>` · `!uptime-vps <#>` · `!myinfo`"
-    ), inline=False)
-    pages["user"] = user_embed
-
-    credits_embed = base_embed("💰 Credits & Plans", "", 0xFFAA00)
-    credits_embed.add_field(name="Commands", value=(
-        "`!plans` · `!buyc` · `!buywc <plan> <Intel/AMD>`\n"
-        "`!credits` · `!transfer @user <amount>` · `!leaderboard`"
-    ), inline=False)
-    pages["credits"] = credits_embed
-
-    extras_embed = base_embed("📢 Extras", "", 0xFF6B9D)
-    extras_embed.add_field(name="Info", value="`!help` · `!botstatus` · `!checkexpire`", inline=False)
-    pages["extras"] = extras_embed
-
-    if user_is_admin:
-        admin_embed = base_embed("🛡️ Admin Panel", "", 0xFF3366)
-        admin_embed.add_field(name="VPS Control", value=(
-            "`!create @user <ram_GB> <cpu_cores> <disk_GB>`\n"
-            "`!delete-vps @user <#> <reason>` · `!restart-vps <container>`\n"
-            "`!stop-vps-all` · `!exec <container> <cmd>`"
-        ), inline=False)
-        admin_embed.add_field(name="Backup", value="`!backup-vps <container>` · `!restore-vps <container> <snapshot>`", inline=False)
-        admin_embed.add_field(name="Info & Economy", value=(
-            "`!userinfo @user` · `!serverstats` · `!list-all`\n"
-            "`!adminc @user <amount>` · `!adminrc @user <amount|all>`\n"
-            "`!announce <msg>` · `!cpu-monitor <status|enable|disable>` · `!maintenance <on|off>`"
-        ), inline=False)
-        admin_embed.add_field(name="Expiry", value=(
-            "`!setexpire @user <#> <days>` · `!extendexpire @user <#> <days>`\n"
-            "`!removeexpire @user <#>` · `!checkexpire [@user]`"
-        ), inline=False)
-        pages["admin"] = admin_embed
-
-    if user_is_main_admin:
-        main_embed = base_embed("👑 Main Admin", "", 0xFFD700)
-        main_embed.add_field(name="Admin Management", value="`!admin-add @user` · `!admin-remove @user` · `!admin-list`", inline=False)
-        pages["mainadmin"] = main_embed
-
-    return pages
-
-
-@bot.command(name="help")
-async def show_help(ctx):
-    user_admin = is_admin_id(ctx.author.id)
-    user_main_admin = str(ctx.author.id) == str(MAIN_ADMIN_ID)
-    pages = build_help_pages(user_admin, user_main_admin)
-
-    options = [
-        discord.SelectOption(label="👤 User Commands", value="user", emoji="👤"),
-        discord.SelectOption(label="💰 Credits & Plans", value="credits", emoji="💰"),
-        discord.SelectOption(label="📢 Extras", value="extras", emoji="📢"),
-    ]
-    if user_admin:
-        options.append(discord.SelectOption(label="🛡️ Admin Panel", value="admin", emoji="🛡️"))
-    if user_main_admin:
-        options.append(discord.SelectOption(label="👑 Main Admin", value="mainadmin", emoji="👑"))
-
-    class HelpSelect(discord.ui.Select):
-        def __init__(self):
-            super().__init__(placeholder="📂 Select a category...", options=options)
-
-        async def callback(self, interaction: discord.Interaction):
-            await interaction.response.edit_message(embed=pages[self.values[0]], view=self.view)
-
-    class HelpView(discord.ui.View):
-        def __init__(self):
-            super().__init__(timeout=180)
-            self.add_item(HelpSelect())
-
-    await ctx.send(embed=pages["user"], view=HelpView())
-
-
-# ─── Entrypoint ─────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-    if not TOKEN:
-        raise SystemExit(
-            "Set the DISCORD_BOT_TOKEN environment variable before running "
-            "(never hardcode your token in the source file)."
-        )
-    bot.run(TOKEN)
+    e.add
