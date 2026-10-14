@@ -1,6 +1,8 @@
 """Shared config, constants, and the bot instance itself."""
 import logging
+import os
 import shutil
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -15,13 +17,31 @@ logger = logging.getLogger("vps_bot")
 if not shutil.which("docker"):
     raise SystemExit("Docker command not found. Please ensure Docker is installed and on PATH.")
 
+
+def _detect_public_ip() -> str:
+    env_ip = os.environ.get("FROSTY_NODE_IP", "").strip()
+    if env_ip:
+        return env_ip
+    for url in ("https://api.ipify.org", "https://icanhazip.com"):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                ip = resp.read().decode().strip()
+                if ip:
+                    return ip
+        except Exception:
+            pass
+    return "127.0.0.1"
+
+
 MAIN_ADMIN_ID = 1520903362667876523          # your Discord user ID
 VPS_USER_ROLE_ID = None                       # filled in automatically once a role is found/created
 DOCKER_IMAGE = "ubuntu:22.04"                 # default/fallback image if no OS picked
 
-# label shown in dropdown -> docker image tag. Debian/Ubuntu only — both apt-based,
-# same setup_script works on all of them. Ubuntu 26.04 is a newer tag; if Docker Hub
-# doesn't have it yet for some reason, pulling it will just fail with a clear error.
+# Default name & IP for the primary node (can be customized via env or Frosty installer)
+DEFAULT_NODE_NAME = os.environ.get("FROSTY_NODE_NAME", "Primary-Node").strip() or "Primary-Node"
+SERVER_PUBLIC_IP = _detect_public_ip()
+SSH_PORT_START = 20000
+
 OS_CHOICES = [
     ("Ubuntu 22.04 LTS", "ubuntu:22.04"),
     ("Ubuntu 24.04 LTS", "ubuntu:24.04"),
@@ -31,11 +51,7 @@ OS_CHOICES = [
     ("Debian 13 (Trixie)", "debian:13"),
 ]
 
-# Real SSH (not just sshx) needs a host port mapped to container:22.
-SERVER_PUBLIC_IP = "YOUR_SERVER_IP"   # <-- set this to your VPS's public IP
-SSH_PORT_START = 20000
-
-CPU_THRESHOLD = 90        # % — pause all VPS if host CPU stays above this
+CPU_THRESHOLD = 90        # % — pause all VPS on a node if its CPU stays above this
 CPU_CHECK_INTERVAL = 60   # seconds between CPU checks
 
 DATA_DIR = Path(__file__).resolve().parent
@@ -43,8 +59,10 @@ USER_DATA_FILE = DATA_DIR / "user_data.json"
 VPS_DATA_FILE = DATA_DIR / "vps_data.json"
 ADMIN_DATA_FILE = DATA_DIR / "admin_data.json"
 INVITE_DATA_FILE = DATA_DIR / "invite_data.json"
+NODES_DATA_FILE = DATA_DIR / "nodes_data.json"
 
-# label -> days (None = no expiry, "custom" = admin types a number)
+NODE_SSH_KEY_PATH = Path("/root/.ssh/frosty_bot_node_key")
+
 EXPIRY_CHOICES = [
     ("1 Month", 30),
     ("2 Months", 60),
@@ -53,10 +71,8 @@ EXPIRY_CHOICES = [
     ("No Expiry", None),
 ]
 RENEW_EXTEND_DAYS = 30
-EXPIRY_WARN_DAYS = (5, 4, 3, 2, 1)   # send a reminder on each of these days-left
+EXPIRY_WARN_DAYS = (5, 4, 3, 2, 1)
 
-# Invite-based rewards (no money) — cumulative invite count -> VPS spec.
-# Ordered smallest to largest; the highest tier a user qualifies for is usable.
 INVITE_TIERS = [
     (6,  {"ram": 6,  "cpu": 2,  "storage": 64}),
     (12, {"ram": 12, "cpu": 3,  "storage": 128}),
