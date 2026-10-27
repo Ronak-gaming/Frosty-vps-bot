@@ -1,6 +1,5 @@
 """Shared config, constants, and the bot instance itself."""
 import logging
-import os
 import shutil
 import urllib.request
 from datetime import datetime
@@ -9,7 +8,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
-# ─── Config ─────────────────────────────────────────────────────────────────
+# ─── Logging & Pre-flight ───────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("vps_bot")
@@ -19,28 +18,26 @@ if not shutil.which("docker"):
 
 
 def _detect_public_ip() -> str:
-    env_ip = os.environ.get("FROSTY_NODE_IP", "").strip()
-    if env_ip:
-        return env_ip
-    for url in ("https://api.ipify.org", "https://icanhazip.com"):
+    for url in ("https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"):
         try:
-            with urllib.request.urlopen(url, timeout=5) as resp:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 ip = resp.read().decode().strip()
-                if ip:
+                if ip and "." in ip:
                     return ip
         except Exception:
             pass
     return "127.0.0.1"
 
 
-MAIN_ADMIN_ID = 1520903362667876523          # your Discord user ID
+# ─── Core Settings ──────────────────────────────────────────────────────────
+
+MAIN_ADMIN_ID = 1520903362667876523          # your Discord user ID (updated by installer if needed)
 VPS_USER_ROLE_ID = None                       # filled in automatically once a role is found/created
 DOCKER_IMAGE = "ubuntu:22.04"                 # default/fallback image if no OS picked
 
-# Default name & IP for the primary node (can be customized via env or Frosty installer)
-DEFAULT_NODE_NAME = os.environ.get("FROSTY_NODE_NAME", "Primary-Node").strip() or "Primary-Node"
-SERVER_PUBLIC_IP = _detect_public_ip()
-SSH_PORT_START = 20000
+# Default name for the primary host node (can be customized at setup or via !node-rename)
+LOCAL_NODE_NAME = "Node-1"
 
 OS_CHOICES = [
     ("Ubuntu 22.04 LTS", "ubuntu:22.04"),
@@ -51,7 +48,10 @@ OS_CHOICES = [
     ("Debian 13 (Trixie)", "debian:13"),
 ]
 
-CPU_THRESHOLD = 90        # % — pause all VPS on a node if its CPU stays above this
+SERVER_PUBLIC_IP = _detect_public_ip()
+SSH_PORT_START = 20000
+
+CPU_THRESHOLD = 90        # % — pause VPS on a node if its host CPU stays above this
 CPU_CHECK_INTERVAL = 60   # seconds between CPU checks
 
 DATA_DIR = Path(__file__).resolve().parent
@@ -60,8 +60,7 @@ VPS_DATA_FILE = DATA_DIR / "vps_data.json"
 ADMIN_DATA_FILE = DATA_DIR / "admin_data.json"
 INVITE_DATA_FILE = DATA_DIR / "invite_data.json"
 NODES_DATA_FILE = DATA_DIR / "nodes_data.json"
-
-NODE_SSH_KEY_PATH = Path("/root/.ssh/frosty_bot_node_key")
+NODE_SSH_KEY = DATA_DIR / "frosty_node_key"
 
 EXPIRY_CHOICES = [
     ("1 Month", 30),
