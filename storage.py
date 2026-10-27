@@ -1,5 +1,6 @@
-"""Persistence (JSON-backed), node registry, small helpers, admin checks, and embed builders."""
+"""Persistence (atomic JSON-backed), multi-node registry, helpers, admin checks, and embed builders."""
 import json
+import os
 import random
 import string
 import threading
@@ -10,18 +11,25 @@ import discord
 from discord.ext import commands
 
 from config import (
-    MAIN_ADMIN_ID, DEFAULT_NODE_NAME, SERVER_PUBLIC_IP,
-    USER_DATA_FILE, VPS_DATA_FILE, ADMIN_DATA_FILE, INVITE_DATA_FILE, NODES_DATA_FILE, logger,
+    MAIN_ADMIN_ID, USER_DATA_FILE, VPS_DATA_FILE, ADMIN_DATA_FILE,
+    INVITE_DATA_FILE, NODES_DATA_FILE, LOCAL_NODE_NAME, SERVER_PUBLIC_IP, logger,
 )
 
 # ─── Persistence ────────────────────────────────────────────────────────────
 
 def _load_json(path: Path, default):
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return default
+
+
+def _atomic_write_json(path: Path, data):
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+    os.replace(tmp_path, path)
 
 
 def load_all():
@@ -44,39 +52,38 @@ def load_all():
 
     invites = _load_json(INVITE_DATA_FILE, {})
 
-    # nodes_data schema:
-    # {
-    #   "NodeName": {
-    #       "name": "NodeName",
-    #       "ip": "1.2.3.4",
-    #       "ssh_port": 22,
-    #       "user": "root",
-    #       "is_local": True/False,
-    #       "added_at": "..."
-    #   }
-    # }
     nodes = _load_json(NODES_DATA_FILE, {})
     if not nodes:
-        nodes[DEFAULT_NODE_NAME] = {
-            "name": DEFAULT_NODE_NAME,
+        nodes[LOCAL_NODE_NAME] = {
+            "name": LOCAL_NODE_NAME,
+            "is_local": True,
             "ip": SERVER_PUBLIC_IP,
             "ssh_port": 22,
             "user": "root",
-            "is_local": True,
-            "added_at": datetime.now().isoformat(),
         }
     else:
-        # Keep local node IP synced if it changed or was placeholder
-        for n_name, n_info in nodes.items():
-            if n_info.get("is_local") and (not n_info.get("ip") or n_info.get("ip") in ("YOUR_SERVER_IP", "127.0.0.1")):
-                n_info["ip"] = SERVER_PUBLIC_IP
+        has_local = False
+        for n_name, n_cfg in nodes.items():
+            n_cfg["name"] = n_name
+            if n_cfg.get("is_local"):
+                has_local = True
+                if not n_cfg.get("ip") or n_cfg.get("ip") in ("YOUR_SERVER_IP", "127.0.0.1"):
+                    n_cfg["ip"] = SERVER_PUBLIC_IP
+        if not has_local:
+            nodes[LOCAL_NODE_NAME] = {
+                "name": LOCAL_NODE_NAME,
+                "is_local": True,
+                "ip": SERVER_PUBLIC_IP,
+                "ssh_port": 22,
+                "user": "root",
+            }
 
-    # Backfill existing VPS entries that don't have a "node" field yet
-    first_node_name = next(iter(nodes.keys()))
+    # Backfill missing "node" field on any legacy VPS entries
+    default_local = next((k for k, v in nodes.items() if v.get("is_local")), LOCAL_NODE_NAME)
     for uid, vlist in vps.items():
-        for v in vlist:
-            if not v.get("node") or v.get("node") not in nodes:
-                v["node"] = first_node_name
+        for item in vlist:
+            if not item.get("node"):
+                item["node"] = default_local
 
     return users, vps, admins, invites, nodes
 
@@ -88,50 +95,37 @@ _save_lock = threading.Lock()
 def save_data():
     with _save_lock:
         try:
-            with open(USER_DATA_FILE, "w") as f:
-                json.dump(user_data, f, indent=4)
-            with open(VPS_DATA_FILE, "w") as f:
-                json.dump(vps_data, f, indent=4)
-            with open(ADMIN_DATA_FILE, "w") as f:
-                json.dump(admin_data, f, indent=4)
-            with open(INVITE_DATA_FILE, "w") as f:
-                json.dump(invite_data, f, indent=4)
-            with open(NODES_DATA_FILE, "w") as f:
-                json.dump(nodes_data, f, indent=4)
+            _atomic_write_json(USER_DATA_FILE, user_data)
+            _atomic_write_json(VPS_DATA_FILE, vps_data)
+            _atomic_write_json(ADMIN_DATA_FILE, admin_data)
+            _atomic_write_json(INVITE_DATA_FILE, invite_data)
+            _atomic_write_json(NODES_DATA_FILE, nodes_data)
         except Exception:
             logger.exception("Failed to save data")
 
 
+# Save initial state so nodes_data.json exists on disk immediately
 save_data()
 
 
-def get_default_node() -> str:
-    for name, info in nodes_data.items():
-        if info.get("is_local"):
+def default_node_name() -> str:
+    for name, cfg in nodes_data.items():
+        if cfg.get("is_local"):
             return name
-    return next(iter(nodes_data.keys()), DEFAULT_NODE_NAME)
+    return next(iter(nodes_data.keys()), LOCAL_NODE_NAME)
 
 
-def get_node_info(node_name: str = None) -> dict:
-    if not node_name or node_name not in nodes_data:
-        node_name = get_default_node()
-    return nodes_data.get(node_name, {
-        "name": DEFAULT_NODE_NAME,
+def get_node(node_name: str = None) -> dict:
+    if node_name and node_name in nodes_data:
+        return nodes_data[node_name]
+    fallback = default_node_name()
+    return nodes_data.get(fallback, {
+        "name": fallback,
+        "is_local": True,
         "ip": SERVER_PUBLIC_IP,
         "ssh_port": 22,
         "user": "root",
-        "is_local": True,
     })
-
-
-def find_vps_by_container(container_name: str, node_name: str = None):
-    """Return (owner_id, index, vps_dict) matching container_name (and optional node_name)."""
-    for uid, vlist in vps_data.items():
-        for idx, v in enumerate(vlist):
-            if v.get("container_name") == container_name:
-                if node_name is None or v.get("node") == node_name:
-                    return uid, idx, v
-    return None, None, None
 
 
 def is_admin_id(user_id) -> bool:
