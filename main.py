@@ -43,7 +43,7 @@ def footer_text() -> str:
     return f"{bot_name} | Multi-Node VPS Manager • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
 
 
-# --- Built-in Zero-Dependency HTTP Pairing Server (Port 8765) ---
+# --- Built-in Zero-Discord VPS-to-VPS Auto-Pairing Server (Port 8765) ---
 async def _handle_pair_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
         data = await asyncio.wait_for(reader.read(8192), timeout=5.0)
@@ -58,20 +58,20 @@ async def _handle_pair_request(reader: asyncio.StreamReader, writer: asyncio.Str
 
         payload = json.loads(body.strip())
         req_token = payload.get("token", "").strip()
-        node_name = payload.get("node_name", "").strip()
+        node_name = payload.get("node_name", "Node-2").strip()
         node_ip = payload.get("ip", "").strip()
         ssh_port = int(payload.get("ssh_port", 22))
         step = payload.get("step", "init")
 
         if req_token != DISCORD_BOT_TOKEN.strip():
-            resp_json = json.dumps({"ok": False, "error": "Token does not match this Primary Bot."})
+            resp_json = json.dumps({"ok": False, "error": "Bot token mismatch."})
             status = "401 Unauthorized"
         else:
             pub_key = ensure_ssh_key()
             bot_tag = str(bot.user) if bot.user else "Frosty-VPS-Bot"
             bot_id = str(bot.user.id) if bot.user else "Unknown"
 
-            if step == "confirm":
+            if step == "confirm" and node_ip:
                 register_node(node_name, node_ip, ssh_port, is_local=False)
 
             resp_json = json.dumps({
@@ -100,8 +100,9 @@ async def _handle_pair_request(reader: asyncio.StreamReader, writer: asyncio.Str
 @bot.event
 async def on_ready():
     ensure_ssh_key()
+    get_nodes()  # Ensures Node-1 is always registered
     bot.loop.create_task(asyncio.start_server(_handle_pair_request, "0.0.0.0", PAIR_API_PORT))
-    print(f"[✓] Logged in as {bot.user} (ID: {bot.user.id}) | Auto-Pair API on port {PAIR_API_PORT}")
+    print(f"[✓] Logged in as {bot.user} (ID: {bot.user.id}) | VPS Auto-Pair API on port {PAIR_API_PORT}")
 
 
 @bot.command(name="node-key")
@@ -109,22 +110,10 @@ async def cmd_node_key(ctx: commands.Context):
     if not is_admin(ctx.author.id):
         return await ctx.reply("❌ Only bot admins can view the SSH key.")
     pub_key = ensure_ssh_key()
-    one_liner = (
-        f"mkdir -p /root/.ssh && chmod 700 /root/.ssh && "
-        f"echo \"{pub_key}\" >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && "
-        f"sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && "
-        f"sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config && "
-        f"(systemctl restart ssh || service ssh restart)"
-    )
     embed = discord.Embed(
         title=f"🔑 Primary Bot SSH Public Key ({bot.user.name})",
         description=f"```\n{pub_key}\n```",
         color=0x00A8FF
-    )
-    embed.add_field(
-        name="⚡ Instant One-Line Worker Fix (Run on Node-2 / Any Worker VPS)",
-        value=f"```bash\n{one_liner}\n```",
-        inline=False
     )
     embed.set_footer(text=footer_text())
     await ctx.reply(embed=embed)
@@ -135,7 +124,7 @@ async def cmd_node_add(ctx: commands.Context, node_name: str = None, ip: str = N
     if not is_admin(ctx.author.id):
         return await ctx.reply("❌ Only bot admins can add nodes.")
     if not node_name or not ip:
-        return await ctx.reply("⚠️ **Usage:** `!node-add <NodeName> <IP> <Port> <RootPassword | KEY_ONLY>`")
+        return await ctx.reply("⚠️ **Usage:** `!node-add <NodeName> <IP> <Port> [RootPassword | KEY_ONLY]`")
 
     msg = await ctx.reply(f"🔄 Pairing **{node_name}** (`{ip}:{port}`) with **{bot.user.name}**...")
     ok, result = await pair_remote_node(node_name, ip, port, auth_secret.strip())
@@ -146,9 +135,7 @@ async def cmd_node_add(ctx: commands.Context, node_name: str = None, ip: str = N
             title="▌ Node Pairing Failed",
             description=(
                 f"Could not pair **{node_name}** (`{ip}:{port}`):\n`{result}`\n\n"
-                f"**Fix Permission Denied — Run this on `{ip}`:**\n"
-                f"```bash\nmkdir -p /root/.ssh && chmod 700 /root/.ssh && echo '{pub_key}' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config && (systemctl restart ssh || service ssh restart)\n```\n"
-                f"Then run: `!node-add {node_name} {ip} {port} KEY_ONLY`"
+                f"**Tip:** You can pair directly from the VPS terminal using Option `[2]` or `[3]` in the Frosty menu without using Discord!"
             ),
             color=0xFF4444
         )
@@ -286,8 +273,8 @@ async def cmd_help(ctx: commands.Context):
         name="🛰️ Multi-Node Admin",
         value=(
             "`!nodes` — View all paired nodes & live status\n"
-            "`!node-key` — Show SSH key & 1-line worker fix\n"
-            "`!node-add <Name> <IP> <Port> <Pass|KEY_ONLY>` — Pair a node\n"
+            "`!node-key` — Show SSH key\n"
+            "`!node-add <Name> <IP> <Port> [Pass|KEY_ONLY]` — Pair a node\n"
             "`!node-rename <Old> <New>` — Rename a node\n"
             "`!node-remove <Name>` — Remove a remote node"
         ),
