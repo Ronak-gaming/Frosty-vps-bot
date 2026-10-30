@@ -1,157 +1,85 @@
-import json
-import os
-from typing import Dict, Any, List
-from config import BOT_DIR, LOCAL_NODE_NAME, SERVER_PUBLIC_IP
-
-USER_FILE = os.path.join(BOT_DIR, "user_data.json")
-VPS_FILE = os.path.join(BOT_DIR, "vps_data.json")
-ADMIN_FILE = os.path.join(ADMIN_DIR if 'ADMIN_DIR' in globals() else BOT_DIR, "admin_data.json")
-INVITE_FILE = os.path.join(BOT_DIR, "invite_data.json")
-NODES_FILE = os.path.join(BOT_DIR, "nodes_data.json")
+import discord
+from typing import Callable, Awaitable
+from storage import get_nodes, delete_user_vps
+from docker_utils import manage_container_power
 
 
-def _load_json(path: str, default: Any) -> Any:
-    if not os.path.exists(path):
-        return default
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+class NodeSelectDropdown(discord.ui.Select):
+    def __init__(self, callback_fn: Callable[[discord.Interaction, str], Awaitable[None]]):
+        nodes = get_nodes()
+        options = []
+        for name, cfg in list(nodes.items())[:25]:
+            kind = "Primary Host" if cfg.get("is_local") else "Worker Node"
+            options.append(
+                discord.SelectOption(
+                    label=name,
+                    description=f"{kind} • {cfg.get('ip')}:{cfg.get('ssh_port', 22)}",
+                    value=name
+                )
+            )
+        super().__init__(placeholder="❄ Select a Node to deploy on...", min_values=1, max_values=1, options=options)
+        self.callback_fn = callback_fn
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.callback_fn(interaction, self.values[0])
 
 
-def _save_json(path: str, data: Any) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
+class NodeSelectView(discord.ui.View):
+    def __init__(self, author_id: int, callback_fn: Callable[[discord.Interaction, str], Awaitable[None]]):
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.add_item(NodeSelectDropdown(callback_fn))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ This menu isn't for you.", ephemeral=True)
+            return False
+        return True
 
 
-def get_nodes() -> Dict[str, Dict[str, Any]]:
-    nodes = _load_json(NODES_FILE, {})
-    has_local = any(cfg.get("is_local") for cfg in nodes.values() if isinstance(cfg, dict))
-    if not nodes or not has_local:
-        default_name = LOCAL_NODE_NAME or "Node-1"
-        nodes[default_name] = {
-            "name": default_name,
-            "is_local": True,
-            "ip": SERVER_PUBLIC_IP,
-            "ssh_port": 22,
-            "user": "root"
-        }
-        save_nodes(nodes)
-    return nodes
+class VPSControlView(discord.ui.View):
+    def __init__(self, owner_id: int, vps_info: dict):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.vps = vps_info
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ Only the VPS owner can use these controls.", ephemeral=True)
+            return False
+        return True
 
-def save_nodes(nodes: Dict[str, Dict[str, Any]]) -> None:
-    _save_json(NODES_FILE, nodes)
+    @discord.ui.button(label="Start", style=discord.ButtonStyle.success, emoji="▶️")
+    async def start_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        ok, msg = await manage_container_power(self.vps["node"], self.vps["container_name"], "start")
+        await interaction.followup.send(f"{'✅ Started' if ok else '❌ Failed'}: `{msg}`", ephemeral=True)
 
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.secondary, emoji="⏹️")
+    async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        ok, msg = await manage_container_power(self.vps["node"], self.vps["container_name"], "stop")
+        await interaction.followup.send(f"{'🛑 Stopped' if ok else '❌ Failed'}: `{msg}`", ephemeral=True)
 
-def register_node(name: str, ip: str, ssh_port: int = 22, is_local: bool = False, user: str = "root") -> Dict[str, Any]:
-    nodes = get_nodes()
-    if is_local:
-        for k in list(nodes.keys()):
-            if nodes[k].get("is_local"):
-                del nodes[k]
-    nodes[name] = {
-        "name": name,
-        "is_local": is_local,
-        "ip": ip,
-        "ssh_port": int(ssh_port),
-        "user": user
-    }
-    save_nodes(nodes)
-    return nodes[name]
+    @discord.ui.button(label="Restart", style=discord.ButtonStyle.primary, emoji="🔄")
+    async def restart_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        ok, msg = await manage_container_power(self.vps["node"], self.vps["container_name"], "restart")
+        await interaction.followup.send(f"{'🔄 Restarted' if ok else '❌ Failed'}: `{msg}`", ephemeral=True)
 
+    @discord.ui.button(label="SSH / Credentials", style=discord.ButtonStyle.secondary, emoji="💻")
+    async def ssh_info_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            f"**SSH Connection (`{self.vps['node']}`):**\n"
+            f"```bash\nssh root@{self.vps['ip']} -p {self.vps['ssh_port']}\n```\n"
+            f"**Password:** `{self.vps['root_password']}`",
+            ephemeral=True
+        )
 
-def remove_node(name: str) -> bool:
-    nodes = get_nodes()
-    if name not in nodes or nodes[name].get("is_local"):
-        return False
-    del nodes[name]
-    save_nodes(nodes)
-    return True
-
-
-def rename_node(old_name: str, new_name: str) -> bool:
-    nodes = get_nodes()
-    if old_name not in nodes:
-        return False
-    cfg = nodes.pop(old_name)
-    cfg["name"] = new_name
-    nodes[new_name] = cfg
-    save_nodes(nodes)
-
-    vps_all = get_all_vps()
-    for uid, vlist in vps_all.items():
-        if isinstance(vlist, list):
-            for v in vlist:
-                if v.get("node") == old_name:
-                    v["node"] = new_name
-    save_all_vps(vps_all)
-    return True
-
-
-def get_all_vps() -> Dict[str, List[Dict[str, Any]]]:
-    return _load_json(VPS_FILE, {})
-
-
-def save_all_vps(data: Dict[str, List[Dict[str, Any]]]) -> None:
-    _save_json(VPS_FILE, data)
-
-
-def get_user_vps(user_id: int) -> List[Dict[str, Any]]:
-    data = get_all_vps()
-    return data.get(str(user_id), [])
-
-
-def add_user_vps(user_id: int, vps_info: Dict[str, Any]) -> None:
-    data = get_all_vps()
-    uid = str(user_id)
-    if uid not in data:
-        data[uid] = []
-    data[uid].append(vps_info)
-    save_all_vps(data)
-
-
-def delete_user_vps(user_id: int, container_name: str) -> bool:
-    data = get_all_vps()
-    uid = str(user_id)
-    if uid not in data:
-        return False
-    before = len(data[uid])
-    data[uid] = [v for v in data[uid] if v.get("container_name") != container_name]
-    save_all_vps(data)
-    return len(data[uid]) < before
-
-
-def get_admins() -> List[int]:
-    data = _load_json(ADMIN_FILE, {"admins": []})
-    return data.get("admins", [])
-
-
-def add_admin(user_id: int) -> None:
-    admins = get_admins()
-    if user_id not in admins:
-        admins.append(user_id)
-        _save_json(ADMIN_FILE, {"admins": admins})
-
-
-def remove_admin(user_id: int) -> None:
-    admins = get_admins()
-    if user_id in admins:
-        admins.remove(user_id)
-        _save_json(ADMIN_FILE, {"admins": admins})
-
-
-def get_user_data(user_id: int) -> Dict[str, Any]:
-    users = _load_json(USER_FILE, {})
-    return users.get(str(user_id), {"credits": 0})
-
-
-def set_user_credits(user_id: int, credits: int) -> None:
-    users = _load_json(USER_FILE, {})
-    uid = str(user_id)
-    if uid not in users:
-        users[uid] = {}
-    users[uid]["credits"] = credits
-    _save_json(USER_FILE, users)
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        await manage_container_power(self.vps["node"], self.vps["container_name"], "rm -f")
+        delete_user_vps(self.owner_id, self.vps["container_name"])
+        await interaction.followup.send(f"🗑️ Deleted `{self.vps['container_name']}` from `{self.vps['node']}`.", ephemeral=True)
+        self.stop()
