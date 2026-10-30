@@ -11,7 +11,7 @@ def ensure_ssh_key() -> str:
     os.makedirs(os.path.dirname(SSH_KEY_PATH), exist_ok=True)
     if not os.path.exists(SSH_KEY_PATH):
         os.system(f'ssh-keygen -t ed25519 -f "{SSH_KEY_PATH}" -N "" -C "frosty-bot-node" >/dev/null 2>&1')
-        os.chmod(SSH_KEY_PATH, 0o600)
+    os.chmod(SSH_KEY_PATH, 0o600)
     if os.path.exists(SSH_PUB_KEY_PATH):
         with open(SSH_PUB_KEY_PATH, "r", encoding="utf-8") as f:
             return f.read().strip()
@@ -38,7 +38,7 @@ async def run_node_cmd(node_name: str, command: str, timeout: int = 120) -> Tupl
         ssh_cmd = (
             f"ssh -i {shlex.quote(SSH_KEY_PATH)} -p {int(port)} "
             f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-            f"-o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=12 "
+            f"-o IdentitiesOnly=yes -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=12 "
             f"{shlex.quote(user)}@{shlex.quote(ip)} {shlex.quote(command)}"
         )
         proc = await asyncio.create_subprocess_shell(
@@ -55,22 +55,37 @@ async def run_node_cmd(node_name: str, command: str, timeout: int = 120) -> Tupl
         return 124, "", "Command timed out"
 
 
-async def pair_remote_node(node_name: str, ip: str, port: int, password_or_mode: str) -> Tuple[bool, str]:
+async def pair_remote_node(node_name: str, ip: str, port: int, password_or_mode: str = "KEY_ONLY") -> Tuple[bool, str]:
     pub_key = ensure_ssh_key()
+    clean_arg = (password_or_mode or "KEY_ONLY").strip()
+
+    # If the user pasted "ssh-ed25519 ..." or "KEY_ONLY", treat it as KEY_ONLY first
+    is_key_mode = (
+        clean_arg.upper() == "KEY_ONLY"
+        or clean_arg.startswith("ssh-ed25519")
+        or clean_arg.startswith("ssh-rsa")
+        or clean_arg == ""
+    )
+
     remote_setup_script = (
-        f"mkdir -p /root/.ssh && chmod 700 /root/.ssh && "
+        f"chown root:root /root && chmod 700 /root && "
+        f"mkdir -p /run/sshd /root/.ssh && chmod 700 /root/.ssh && "
+        f"touch /root/.ssh/authorized_keys && "
         f"(grep -qxF '{pub_key}' /root/.ssh/authorized_keys 2>/dev/null || echo '{pub_key}' >> /root/.ssh/authorized_keys) && "
-        f"chmod 600 /root/.ssh/authorized_keys && "
+        f"chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root/.ssh && "
+        f"rm -f /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true && "
         f"sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null || true && "
         f"sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true && "
-        f"(systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || service ssh restart 2>/dev/null || true) && "
+        f"sed -i 's/^#*StrictModes.*/StrictModes no/' /etc/ssh/sshd_config 2>/dev/null || true && "
+        f"sed -i 's/^#*AuthorizedKeysFile.*/AuthorizedKeysFile .ssh\\/authorized_keys/' /etc/ssh/sshd_config 2>/dev/null || true && "
+        f"(systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || service ssh restart 2>/dev/null || pkill -HUP sshd 2>/dev/null || /usr/sbin/sshd 2>/dev/null || true) && "
         f"if ! command -v docker >/dev/null 2>&1; then curl -fsSL https://get.docker.com | sh >/dev/null 2>&1; fi && "
         f"docker info --format '{{{{.ServerVersion}}}}'"
     )
 
-    if password_or_mode.upper() != "KEY_ONLY":
+    if not is_key_mode:
         env = os.environ.copy()
-        env["SSHPASS"] = password_or_mode
+        env["SSHPASS"] = clean_arg
         cmd = (
             f"sshpass -e ssh -p {int(port)} "
             f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
@@ -86,11 +101,10 @@ async def pair_remote_node(node_name: str, ip: str, port: int, password_or_mode:
             err_msg = stderr.decode(errors="ignore").strip() or "SSH password login failed"
             return False, err_msg
 
-    # Verify passwordless SSH key authentication works
     verify_cmd = (
         f"ssh -i {shlex.quote(SSH_KEY_PATH)} -p {int(port)} "
         f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-        f"-o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=12 "
+        f"-o IdentitiesOnly=yes -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=12 "
         f"root@{shlex.quote(ip)} \"docker info --format '{{{{.ServerVersion}}}}'\""
     )
     proc = await asyncio.create_subprocess_shell(
