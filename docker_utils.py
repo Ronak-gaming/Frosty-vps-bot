@@ -59,7 +59,6 @@ async def pair_remote_node(node_name: str, ip: str, port: int, password_or_mode:
     pub_key = ensure_ssh_key()
     clean_arg = (password_or_mode or "KEY_ONLY").strip()
 
-    # If the user pasted "ssh-ed25519 ..." or "KEY_ONLY", treat it as KEY_ONLY first
     is_key_mode = (
         clean_arg.upper() == "KEY_ONLY"
         or clean_arg.startswith("ssh-ed25519")
@@ -130,7 +129,7 @@ async def get_node_stats(node_name: str) -> Dict[str, Any]:
     parts = out.splitlines()[-1].split("|")
     return {
         "online": True,
-        "cores": parts[0] if len(parts) > 0 else "?",
+        "cores": parts[0] if len(parts) > 0 else "1",
         "ram": parts[1] if len(parts) > 1 else "?",
         "uptime": parts[2] if len(parts) > 2 else "up",
         "containers": parts[3] if len(parts) > 3 else "0"
@@ -147,10 +146,14 @@ async def create_vps_container(node_name: str, user_id: int, ram_gb: int, cores:
     root_pass = f"Frosty@{random.randint(100000, 999999)}"
     container_name = f"vps-{user_id}-{random.randint(1000, 9999)}"
 
+    # Automatically clamp --cpus to the host's actual CPU count (nproc) so 1-CPU nodes like Tcodes NEVER fail!
     setup_cmd = (
+        f"HOST_CPUS=$(nproc 2>/dev/null || echo 1); "
+        f"REQ_CPUS={cores}; "
+        f"if [ \"$REQ_CPUS\" -gt \"$HOST_CPUS\" ]; then USE_CPUS=\"$HOST_CPUS\"; else USE_CPUS=\"$REQ_CPUS\"; fi; "
         f"docker run -d --name {container_name} --hostname {container_name} "
-        f"--memory={ram_gb}g --cpus={cores} -p {ssh_port}:22 --restart unless-stopped {DOCKER_IMAGE} "
-        f"bash -c \"apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server sudo curl nano tmate && "
+        f"--memory={ram_gb}g --cpus=\"$USE_CPUS\" -p {ssh_port}:22 --restart unless-stopped {DOCKER_IMAGE} "
+        f"bash -c \"apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server sudo curl wget nano tmate neofetch && "
         f"mkdir -p /run/sshd && echo 'root:{root_pass}' | chpasswd && "
         f"sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && "
         f"sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && "
@@ -172,6 +175,25 @@ async def create_vps_container(node_name: str, user_id: int, ram_gb: int, cores:
         "disk_gb": disk_gb
     }
     return True, vps_info, ""
+
+
+async def get_tmate_session(node_name: str, container_name: str) -> Tuple[bool, str]:
+    cmd = (
+        f"docker exec {shlex.quote(container_name)} bash -c "
+        f"\"tmate -S /tmp/tmate.sock new-session -d && tmate -S /tmp/tmate.sock wait tmate-ready && "
+        f"tmate -S /tmp/tmate.sock display -p '#{{tmate_ssh}}'\""
+    )
+    rc, out, err = await run_node_cmd(node_name, cmd, timeout=25)
+    if rc == 0 and "ssh " in out:
+        return True, out.splitlines()[-1].strip()
+    return False, err or "Could not generate tmate session"
+
+
+async def reset_container_password(node_name: str, container_name: str) -> Tuple[bool, str]:
+    new_pass = f"Frosty@{random.randint(100000, 999999)}"
+    cmd = f"docker exec {shlex.quote(container_name)} bash -c \"echo 'root:{new_pass}' | chpasswd\""
+    rc, out, err = await run_node_cmd(node_name, cmd, timeout=20)
+    return (rc == 0), (new_pass if rc == 0 else (err or "Failed to reset password"))
 
 
 async def manage_container_power(node_name: str, container_name: str, action: str) -> Tuple[bool, str]:
