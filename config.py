@@ -5,10 +5,15 @@ MAIN_ADMIN_ID = 123456789012345678  # Replaced by installer
 LOCAL_NODE_NAME = "Node-1"
 SERVER_PUBLIC_IP = "YOUR_SERVER_IP"
 
+BOT_VERSION = "2.5.0"
 BOT_DIR = "/opt/Frosty-vps-bot"
 SSH_KEY_PATH = os.path.join(BOT_DIR, "frosty_node_key")
 SSH_PUB_KEY_PATH = os.path.join(BOT_DIR, "frosty_node_key.pub")
+WEBSSH_HTML_PATH = os.path.join(BOT_DIR, "webssh.html")
+
+# Port for BOTH WebSSH Console (http://SERVER_IP:8765/ssh/<token>) & Node Auto-Pairing
 PAIR_API_PORT = int(os.getenv("PAIR_API_PORT", "8765"))
+WEBSSH_PORT = PAIR_API_PORT
 
 DEFAULT_RAM_GB = 2
 DEFAULT_CPU_CORES = 1
