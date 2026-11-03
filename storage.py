@@ -26,7 +26,6 @@ def _save_json(path: str, data: Any) -> None:
         json.dump(data, f, indent=4)
 
 
-# --- Nodes ---
 def get_nodes() -> Dict[str, Dict[str, Any]]:
     nodes = _load_json(NODES_FILE, {})
     has_local = any(cfg.get("is_local") for cfg in nodes.values() if isinstance(cfg, dict))
@@ -92,7 +91,6 @@ def rename_node(old_name: str, new_name: str) -> bool:
     return True
 
 
-# --- VPS Containers ---
 def get_all_vps() -> Dict[str, List[Dict[str, Any]]]:
     return _load_json(VPS_FILE, {})
 
@@ -139,7 +137,6 @@ def delete_user_vps(user_id: int, container_name: str) -> bool:
     return len(data[uid]) < before
 
 
-# --- Admins ---
 def get_admins() -> List[int]:
     data = _load_json(ADMIN_FILE, {"admins": []})
     if isinstance(data, list):
@@ -161,7 +158,6 @@ def remove_admin(user_id: int) -> None:
         _save_json(ADMIN_FILE, {"admins": admins})
 
 
-# --- Credits & Users ---
 def get_user_data(user_id: int) -> Dict[str, Any]:
     users = _load_json(USER_FILE, {})
     return users.get(str(user_id), {"credits": 0, "invites": 0})
@@ -179,12 +175,3 @@ def add_credits(user_id: int, amount: int) -> int:
     users[uid]["credits"] = max(0, int(users[uid].get("credits", 0)) + int(amount))
     _save_json(USER_FILE, users)
     return users[uid]["credits"]
-
-
-def set_user_credits(user_id: int, credits: int) -> None:
-    users = _load_json(USER_FILE, {})
-    uid = str(user_id)
-    if uid not in users:
-        users[uid] = {"credits": 0, "invites": 0}
-    users[uid]["credits"] = max(0, int(credits))
-    _save_json(USER_FILE, users)
