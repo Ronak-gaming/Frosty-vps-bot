@@ -1,6 +1,7 @@
 import asyncio
 import os
 import random
+import re
 import shlex
 from typing import Tuple, Dict, Any
 from config import SSH_KEY_PATH, SSH_PUB_KEY_PATH, DOCKER_IMAGE
@@ -151,9 +152,10 @@ async def create_vps_container(node_name: str, user_id: int, ram_gb: int, cores:
         f"REQ_CPUS={cores}; "
         f"if [ \"$REQ_CPUS\" -gt \"$HOST_CPUS\" ]; then USE_CPUS=\"$HOST_CPUS\"; else USE_CPUS=\"$REQ_CPUS\"; fi; "
         f"docker run -d --name {container_name} --hostname {container_name} "
-        f"--memory={ram_gb}g --cpus=\"$USE_CPUS\" -p {ssh_port}:22 --restart unless-stopped {DOCKER_IMAGE} "
+        f"--memory={ram_gb}g --cpus=\"$USE_CPUS\" -p 0.0.0.0:{ssh_port}:22 --restart unless-stopped {DOCKER_IMAGE} "
         f"bash -c \"mkdir -p /var/cache/apt/tmp && TMPDIR=/var/cache/apt/tmp apt-get update && "
         f"TMPDIR=/var/cache/apt/tmp DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server sudo curl wget nano tmate ca-certificates && "
+        f"(curl -sSf https://sshx.io/get | sh >/dev/null 2>&1 || true) && "
         f"mkdir -p /run/sshd && echo 'root:{root_pass}' | chpasswd && "
         f"rm -f /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true && "
         f"sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && "
@@ -165,10 +167,11 @@ async def create_vps_container(node_name: str, user_id: int, ram_gb: int, cores:
     if rc != 0:
         return False, {}, err or "Failed to create container"
 
+    node_ip = node.get("ip", "127.0.0.1")
     vps_info = {
         "container_name": container_name,
         "node": node_name,
-        "ip": node.get("ip"),
+        "ip": node_ip,
         "ssh_port": ssh_port,
         "root_password": root_pass,
         "ram_gb": ram_gb,
@@ -176,6 +179,24 @@ async def create_vps_container(node_name: str, user_id: int, ram_gb: int, cores:
         "disk_gb": disk_gb
     }
     return True, vps_info, ""
+
+
+async def get_sshx_session(node_name: str, container_name: str) -> Tuple[bool, str]:
+    cmd = (
+        f"docker exec {shlex.quote(container_name)} bash -c \""
+        f"if ! command -v sshx >/dev/null 2>&1; then curl -sSf https://sshx.io/get | sh >/dev/null 2>&1; fi; "
+        f"pkill -f 'sshx' 2>/dev/null || true; "
+        f"nohup sshx > /tmp/sshx.log 2>&1 & "
+        f"for i in 1 2 3 4 5 6 7 8; do "
+        f"  grep -oE 'https://sshx\\.io/s/[A-Za-z0-9_#-]+' /tmp/sshx.log | head -n 1 && break; "
+        f"  sleep 1; "
+        f"done\""
+    )
+    rc, out, err = await run_node_cmd(node_name, cmd, timeout=30)
+    match = re.search(r"https://sshx\.io/s/[A-Za-z0-9_#-]+", out)
+    if match:
+        return True, match.group(0)
+    return False, err or out or "Failed to generate SSHX link (ensure container is running)"
 
 
 async def get_tmate_session(node_name: str, container_name: str) -> Tuple[bool, str]:
