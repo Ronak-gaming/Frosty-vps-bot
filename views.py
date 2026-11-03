@@ -1,8 +1,8 @@
 import discord
-from datetime import datetime
 from typing import Callable, Awaitable, List
 from storage import get_nodes, delete_user_vps, update_user_vps
 from docker_utils import manage_container_power, get_tmate_session, reset_container_password
+from webssh_server import create_webssh_link
 
 
 class HelpPaginatorView(discord.ui.View):
@@ -17,41 +17,40 @@ class HelpPaginatorView(discord.ui.View):
         footer = f"{self.bot_name} | Multi-Node VPS Manager"
 
         p1 = discord.Embed(
-            title=f"❄️ {self.bot_name} — Help Menu (Page 1/4: 🖥️ User VPS Commands)",
-            description="Manage your personal VPS containers, check resources, and connect via SSH or Tmate.",
+            title=f"❄️ {self.bot_name} — Help Menu (Page 1/4: 🖥️ User VPS & WebSSH)",
+            description="Manage your personal VPS containers and open a live WebSSH terminal in your browser.",
             color=0x00A8FF
         )
-        p1.add_field(name="`!myvps` / `!vps`", value="Open interactive control panel (Start/Stop/Restart/Tmate/Password/Delete) for your VPS.", inline=False)
+        p1.add_field(name="`!myvps` / `!vps`", value="Open interactive control panel (Start, Stop, Restart, **WebSSH Console**, Tmate, Reset Password, Delete).", inline=False)
+        p1.add_field(name="`!webssh`", value="Generate an instant PIN-protected **Live Browser WebSSH** link for your VPS.", inline=False)
         p1.add_field(name="`!plans` / `!shop`", value="View available VPS plans and credit prices.", inline=False)
-        p1.add_field(name="`!buy <PlanName>`", value="Purchase and auto-deploy a VPS on your chosen node using credits.", inline=False)
-        p1.add_field(name="`!ping`", value="Check bot latency and node responsiveness.", inline=False)
+        p1.add_field(name="`!buy <PlanName>`", value="Purchase and auto-deploy a VPS on your chosen node.", inline=False)
         p1.set_footer(text=f"{footer} • Page 1/4")
 
         p2 = discord.Embed(
-            title=f"❄️ {self.bot_name} — Help Menu (Page 2/4: 💰 Credits & Invites)",
-            description="Earn or check credits and purchase instant multi-node VPS hosting.",
+            title=f"❄️ {self.bot_name} — Help Menu (Page 2/4: 💰 Credits & Economy)",
+            description="Earn or transfer credits to deploy multi-node VPS containers.",
             color=0x00FF88
         )
         p2.add_field(name="`!credits` / `!bal` [@user]", value="Check your current credit balance.", inline=False)
         p2.add_field(name="`!pay <@user> <amount>`", value="Transfer credits to another user.", inline=False)
-        p2.add_field(name="`!invites` [@user]", value="Check your tracked server invites and earned bonus credits.", inline=False)
         p2.set_footer(text=f"{footer} • Page 2/4")
 
         p3 = discord.Embed(
             title=f"❄️ {self.bot_name} — Help Menu (Page 3/4: 🛰️ Multi-Node Management)",
-            description="Connect, monitor, rename, or remove remote VPS worker nodes across the globe.",
+            description="Connect, monitor, rename, or remove remote VPS worker nodes.",
             color=0x9B59B6
         )
-        p3.add_field(name="`!nodes`", value="View all paired nodes (`Node-1`, `Tcodes`, `Node-2`, etc.), live CPU/RAM, and container counts.", inline=False)
+        p3.add_field(name="`!nodes`", value="View all paired nodes (`Node-1`, `Node-2`, etc.), live CPU/RAM, and container counts.", inline=False)
         p3.add_field(name="`!node-add <Name> <IP> <Port> [Pass|KEY_ONLY]`", value="Pair a new remote worker VPS node.", inline=False)
         p3.add_field(name="`!node-rename <OldName> <NewName>`", value="Rename an existing node and migrate all VPS records.", inline=False)
         p3.add_field(name="`!node-remove <Name>`", value="Unpair and remove a remote worker node.", inline=False)
-        p3.add_field(name="`!node-key`", value="View the Primary Bot's SSH public key for manual pairing.", inline=False)
+        p3.add_field(name="`!node-key`", value="View the Primary Bot's SSH public key.", inline=False)
         p3.set_footer(text=f"{footer} • Page 3/4")
 
         p4 = discord.Embed(
             title=f"❄️ {self.bot_name} — Help Menu (Page 4/4: 🛡️ Admin & Staff Commands)",
-            description="Administrator tools for deploying custom containers, managing user credits, and staff access.",
+            description="Administrator tools for deploying custom containers and managing user credits.",
             color=0xFFAA00
         )
         p4.add_field(name="`!deploy <@user> [ram_gb] [cores] [disk_gb]`", value="Deploy a custom VPS on any node via interactive dropdown.", inline=False)
@@ -163,6 +162,25 @@ class VPSControlView(discord.ui.View):
         ok, msg = await manage_container_power(self.vps["node"], self.vps["container_name"], "restart")
         await interaction.followup.send(f"{'🔄 Restarted' if ok else '❌ Failed'}: `{msg}`", ephemeral=True)
 
+    @discord.ui.button(label="WebSSH Console", style=discord.ButtonStyle.primary, emoji="🖥️", row=1)
+    async def webssh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        bot_name = interaction.client.user.name if interaction.client.user else "FrostyHosting"
+        session = create_webssh_link(bot_name, self.vps, require_pin=True)
+        embed = discord.Embed(
+            title=f"🖥️ Live WebSSH Console — {self.vps['container_name']}",
+            description=(
+                f"**🔗 Click to Open Terminal:**\n{session['url']}\n\n"
+                f"**🛡️ Terminal Unlock PIN:** `{session['pin']}`\n"
+                f"**📍 Node:** `{self.vps.get('node', 'Node-1')}` (`{self.vps['ip']}:{self.vps['ssh_port']}`)"
+            ),
+            color=0x7C6AFF
+        )
+        try:
+            await interaction.user.send(embed=embed)
+        except Exception:
+            pass
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
     @discord.ui.button(label="SSH Details", style=discord.ButtonStyle.secondary, emoji="💻", row=1)
     async def ssh_info_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
@@ -172,16 +190,16 @@ class VPSControlView(discord.ui.View):
             ephemeral=True
         )
 
-    @discord.ui.button(label="Tmate Web SSH", style=discord.ButtonStyle.primary, emoji="🌐", row=1)
+    @discord.ui.button(label="Tmate", style=discord.ButtonStyle.secondary, emoji="🌐", row=1)
     async def tmate_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         ok, session = await get_tmate_session(self.vps["node"], self.vps["container_name"])
         if ok:
-            await interaction.followup.send(f"🌐 **Instant Tmate SSH Session:**\n```bash\n{session}\n```", ephemeral=True)
+            await interaction.followup.send(f"🌐 **Tmate SSH Session:**\n```bash\n{session}\n```", ephemeral=True)
         else:
             await interaction.followup.send(f"❌ Tmate failed: `{session}`", ephemeral=True)
 
-    @discord.ui.button(label="Reset Password", style=discord.ButtonStyle.secondary, emoji="🔑", row=1)
+    @discord.ui.button(label="Reset Password", style=discord.ButtonStyle.secondary, emoji="🔑", row=2)
     async def pass_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         ok, new_pass = await reset_container_password(self.vps["node"], self.vps["container_name"])
@@ -192,7 +210,7 @@ class VPSControlView(discord.ui.View):
         else:
             await interaction.followup.send(f"❌ Failed: `{new_pass}`", ephemeral=True)
 
-    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️", row=1)
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️", row=2)
     async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         await manage_container_power(self.vps["node"], self.vps["container_name"], "rm -f")
