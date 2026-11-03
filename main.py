@@ -30,10 +30,11 @@ from docker_utils import (
     ensure_ssh_key,
     pair_remote_node,
     get_node_stats,
-    create_vps_container
+    create_vps_container,
+    get_sshx_session
 )
 from views import HelpPaginatorView, NodeSelectView, VPSControlView
-from webssh_server import handle_http_request, create_webssh_link
+from webssh_server import handle_http_request, create_webssh_link, get_public_webssh_base
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -46,8 +47,8 @@ def is_admin(user_id: int) -> bool:
 
 
 def footer_text() -> str:
-    bot_name = bot.user.name if bot.user else "FrostyHosting"
-    return f"{bot_name} | Multi-Node VPS & WebSSH Manager • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
+    bot_name = bot.user.name if bot.user else "ApexHosting"
+    return f"{bot_name} | WebSSH & SSHX Cloud Manager • {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
 
 
 @bot.event
@@ -57,18 +58,31 @@ async def on_ready():
     bot.loop.create_task(
         asyncio.start_server(lambda r, w: handle_http_request(r, w, bot), "0.0.0.0", WEBSSH_PORT)
     )
-    print(f"[✓] Logged in as {bot.user} (ID: {bot.user.id}) | WebSSH & Auto-Pair Server active on port {WEBSSH_PORT}")
+    print(f"[✓] Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"[✓] WebSSH listening on 0.0.0.0:{WEBSSH_PORT} -> Public URL: {get_public_webssh_base()}")
 
 
 @bot.command(name="help", aliases=["commands", "h"])
 async def cmd_help(ctx: commands.Context):
-    view = HelpPaginatorView(ctx.author.id, bot.user.name if bot.user else "Frosty Bot")
+    bot_name = bot.user.name if bot.user else "ApexHosting"
+    avatar = bot.user.display_avatar.url if bot.user else None
+    view = HelpPaginatorView(ctx.author.id, bot_name, avatar)
     await ctx.reply(embed=view.pages[0], view=view)
 
 
 @bot.command(name="ping")
 async def cmd_ping(ctx: commands.Context):
-    await ctx.reply(f"🏓 Pong! Latency: `{round(bot.latency * 1000)}ms`")
+    embed = discord.Embed(
+        title="🏓 Gateway & Tunnel Status",
+        description=(
+            f"**Discord Latency:** `{round(bot.latency * 1000)}ms`\n"
+            f"**WebSSH Endpoint:** `{get_public_webssh_base()}`\n"
+            f"**Local Listener Port:** `{WEBSSH_PORT}`"
+        ),
+        color=0x2ECC71
+    )
+    embed.set_footer(text=footer_text())
+    await ctx.reply(embed=embed)
 
 
 @bot.command(name="webssh", aliases=["console", "terminal"])
@@ -76,7 +90,7 @@ async def cmd_webssh(ctx: commands.Context):
     vps_list = get_user_vps(ctx.author.id)
     if not vps_list:
         return await ctx.reply("📭 You don't have any active VPS containers.")
-    bot_name = bot.user.name if bot.user else "FrostyHosting"
+    bot_name = bot.user.name if bot.user else "ApexHosting"
     for v in vps_list:
         session = create_webssh_link(bot_name, v, require_pin=True)
         embed = discord.Embed(
@@ -84,7 +98,7 @@ async def cmd_webssh(ctx: commands.Context):
             description=(
                 f"**🔗 WebSSH URL:** {session['url']}\n"
                 f"**🛡️ Unlock PIN:** `{session['pin']}`\n"
-                f"**📍 Node:** `{v.get('node', 'Node-1')}` (`{v['ip']}:{v['ssh_port']}`)"
+                f"**🛰️ Node:** `{v.get('node', 'Node-1')}` *(Private IPv4 Ready)*"
             ),
             color=0x7C6AFF
         )
@@ -96,11 +110,35 @@ async def cmd_webssh(ctx: commands.Context):
             await ctx.reply(embed=embed)
 
 
+@bot.command(name="sshx")
+async def cmd_sshx(ctx: commands.Context):
+    vps_list = get_user_vps(ctx.author.id)
+    if not vps_list:
+        return await ctx.reply("📭 You don't have any active VPS containers.")
+    status = await ctx.reply("⚡ Generating live **SSHX** browser terminal link(s)...")
+    for v in vps_list:
+        ok, url = await get_sshx_session(v.get("node", "Node-1"), v["container_name"])
+        if ok:
+            embed = discord.Embed(
+                title=f"⚡ SSHX Collaborative Terminal — {v['container_name']}",
+                description=f"**🔗 Click to Open SSHX:**\n{url}\n\n**🛰️ Node:** `{v.get('node', 'Node-1')}`",
+                color=0x2ECC71
+            )
+            embed.set_footer(text=footer_text())
+            try:
+                await ctx.author.send(embed=embed)
+                await status.edit(content=f"📬 Sent your **SSHX** terminal link for `{v['container_name']}` to your DMs!")
+            except Exception:
+                await status.edit(content=None, embed=embed)
+        else:
+            await status.edit(content=f"❌ Failed to generate SSHX for `{v['container_name']}`: `{url}`")
+
+
 @bot.command(name="credits", aliases=["bal", "balance"])
 async def cmd_credits(ctx: commands.Context, member: discord.Member = None):
     target = member or ctx.author
     bal = get_credits(target.id)
-    embed = discord.Embed(title="💰 Credit Balance", description=f"{target.mention} has **`{bal}` Credits**.", color=0x00FF88)
+    embed = discord.Embed(title="💎 Credit Wallet", description=f"{target.mention} has **`{bal}` Credits**.", color=0x2ECC71)
     embed.set_footer(text=footer_text())
     await ctx.reply(embed=embed)
 
@@ -135,14 +173,14 @@ async def cmd_pay(ctx: commands.Context, member: discord.Member, amount: int):
 @bot.command(name="plans", aliases=["shop"])
 async def cmd_plans(ctx: commands.Context):
     embed = discord.Embed(
-        title=f"🛒 {bot.user.name} — VPS Plans",
-        description="Use `!buy <PlanName>` to deploy instantly on any available node!",
-        color=0x00A8FF
+        title=f"🛒 {bot.user.name} — Cloud VPS Plans",
+        description="Use `!buy <PlanName>` to deploy instantly with **WebSSH** & **SSHX** access!",
+        color=0x7C6AFF
     )
     for name, p in VPS_PLANS.items():
         embed.add_field(
-            name=f"📦 {name} — `{p['price']} Credits`",
-            value=f"**RAM:** `{p['ram']} GB` | **CPU:** `{p['cpu']} Cores` | **Disk:** `{p['disk']} GB`",
+            name=f"📦 {name} Tier — `{p['price']} Credits`",
+            value=f"**RAM:** `{p['ram']} GB` • **vCPU:** `{p['cpu']} Cores` • **NVMe:** `{p['disk']} GB`",
             inline=False
         )
     embed.set_footer(text=footer_text())
@@ -166,29 +204,33 @@ async def cmd_buy(ctx: commands.Context, plan_name: str = None):
             return await interaction.response.edit_message(content="❌ Insufficient credits.", view=None)
         add_credits(ctx.author.id, -plan["price"])
         await interaction.response.edit_message(
-            content=f"⚙️ Deploying **{matched}** (`{plan['ram']}GB RAM / {plan['cpu']} CPU`) on **{picked_node}**...",
+            content=f"⚙️ Provisioning **{matched}** (`{plan['ram']}GB RAM / {plan['cpu']} CPU`) on **{picked_node}** (Installing SSHX & WebSSH)...",
             view=None
         )
         ok, vps_info, err = await create_vps_container(picked_node, ctx.author.id, plan["ram"], plan["cpu"], plan["disk"])
         if not ok:
             add_credits(ctx.author.id, plan["price"])
-            return await interaction.edit_original_response(content=f"❌ Deployment failed on `{picked_node}` (Credits refunded):\n`{err}`")
+            return await interaction.edit_original_response(content=f"❌ Provisioning failed on `{picked_node}` (Credits refunded):\n`{err}`")
 
         add_user_vps(ctx.author.id, vps_info)
-        bot_name = bot.user.name if bot.user else "FrostyHosting"
+        bot_name = bot.user.name if bot.user else "ApexHosting"
         webssh = create_webssh_link(bot_name, vps_info, require_pin=True)
+        sshx_ok, sshx_url = await get_sshx_session(picked_node, vps_info["container_name"])
+        sshx_line = sshx_url if sshx_ok else "Click **⚡ SSHX Link** button in `!myvps`"
+
         try:
             dm_embed = discord.Embed(
-                title=f"🎉 Your {matched} VPS on {picked_node} is Ready!",
+                title=f"🎉 Your {matched} VPS on {picked_node} is Live!",
                 description=(
-                    f"**Node:** `{picked_node}`\n"
-                    f"**SSH Command:** `ssh root@{vps_info['ip']} -p {vps_info['ssh_port']}`\n"
-                    f"**Root Password:** `{vps_info['root_password']}`\n"
-                    f"**🖥️ Live WebSSH Link:** {webssh['url']}\n"
-                    f"**🛡️ WebSSH PIN:** `{webssh['pin']}`\n"
-                    f"**Specs:** `{plan['ram']}GB RAM` | `{plan['cpu']} vCPU` | `{plan['disk']}GB Disk`"
+                    f"**🆔 Container:** `{vps_info['container_name']}`\n"
+                    f"**🛰️ Node:** `{picked_node}` *(Private IPv4 Ready)*\n"
+                    f"**🔑 Root Password:** `{vps_info['root_password']}`\n\n"
+                    f"**🖥️ Cloudflare WebSSH Console:**\n{webssh['url']}\n"
+                    f"**🛡️ WebSSH Unlock PIN:** `{webssh['pin']}`\n\n"
+                    f"**⚡ Instant SSHX Browser Terminal:**\n{sshx_line}\n\n"
+                    f"**📊 Specs:** `{plan['ram']}GB RAM` • `{plan['cpu']} vCPU` • `{plan['disk']}GB Disk`"
                 ),
-                color=0x00FF88
+                color=0x2ECC71
             )
             dm_embed.set_footer(text=footer_text())
             await ctx.author.send(embed=dm_embed)
@@ -196,7 +238,7 @@ async def cmd_buy(ctx: commands.Context, plan_name: str = None):
             pass
 
         await interaction.edit_original_response(
-            content=f"✅ Deployed `{vps_info['container_name']}` on **{picked_node}**! (SSH & WebSSH link sent to DMs)",
+            content=f"✅ Provisioned `{vps_info['container_name']}` on **{picked_node}**! (WebSSH & SSHX links sent to DMs)",
             view=VPSControlView(ctx.author.id, vps_info)
         )
 
@@ -204,6 +246,76 @@ async def cmd_buy(ctx: commands.Context, plan_name: str = None):
         f"❄ Select a node to deploy your **{matched}** VPS (`{plan['ram']}GB RAM / {plan['cpu']} CPU`):",
         view=NodeSelectView(ctx.author.id, on_node_picked)
     )
+
+
+@bot.command(name="create", aliases=["deploy", "create-vps"])
+async def cmd_create(ctx: commands.Context, member: discord.Member = None, ram_gb: int = DEFAULT_RAM_GB, cores: int = DEFAULT_CPU_CORES, disk_gb: int = DEFAULT_DISK_GB):
+    if not is_admin(ctx.author.id):
+        return await ctx.reply("❌ Only admins can create new VPS containers.")
+    target = member or ctx.author
+
+    async def on_node_picked(interaction: discord.Interaction, picked_node: str):
+        await interaction.response.edit_message(
+            content=f"⚙️ Creating `{ram_gb}GB RAM / {cores} CPU` VPS for {target.mention} on **{picked_node}** (Configuring WebSSH & SSHX)...",
+            view=None
+        )
+        ok, vps_info, err = await create_vps_container(picked_node, target.id, ram_gb, cores, disk_gb)
+        if not ok:
+            return await interaction.edit_original_response(content=f"❌ Creation failed on `{picked_node}`:\n`{err}`")
+
+        add_user_vps(target.id, vps_info)
+        bot_name = bot.user.name if bot.user else "ApexHosting"
+        webssh = create_webssh_link(bot_name, vps_info, require_pin=True)
+        sshx_ok, sshx_url = await get_sshx_session(picked_node, vps_info["container_name"])
+        sshx_line = sshx_url if sshx_ok else "Click **⚡ SSHX Link** button in `!myvps`"
+
+        try:
+            dm_embed = discord.Embed(
+                title=f"🎉 Your VPS on {picked_node} is Ready!",
+                description=(
+                    f"**🆔 Container:** `{vps_info['container_name']}`\n"
+                    f"**🛰️ Node:** `{picked_node}` *(Private IPv4 Ready)*\n"
+                    f"**🔑 Root Password:** `{vps_info['root_password']}`\n\n"
+                    f"**🖥️ Cloudflare WebSSH Console:**\n{webssh['url']}\n"
+                    f"**🛡️ WebSSH Unlock PIN:** `{webssh['pin']}`\n\n"
+                    f"**⚡ Instant SSHX Terminal:**\n{sshx_line}\n\n"
+                    f"**📊 Specs:** `{ram_gb}GB RAM` • `{cores} vCPU` • `{disk_gb}GB Disk`"
+                ),
+                color=0x2ECC71
+            )
+            dm_embed.set_footer(text=footer_text())
+            await target.send(embed=dm_embed)
+        except Exception:
+            pass
+
+        await interaction.edit_original_response(
+            content=f"✅ Created `{vps_info['container_name']}` on **{picked_node}** for {target.mention}! (WebSSH & SSHX links sent via DM)",
+            view=VPSControlView(target.id, vps_info)
+        )
+
+    await ctx.reply(
+        f"❄ Choose which Node to create {target.mention}'s VPS on (`{ram_gb}GB RAM / {cores} Cores`):",
+        view=NodeSelectView(ctx.author.id, on_node_picked)
+    )
+
+
+@bot.command(name="myvps", aliases=["vps"])
+async def cmd_myvps(ctx: commands.Context):
+    vps_list = get_user_vps(ctx.author.id)
+    if not vps_list:
+        return await ctx.reply("📭 You don't have any active VPS containers.")
+    for v in vps_list:
+        embed = discord.Embed(
+            title=f"🖥️ {v['container_name']} • {v.get('node', 'Node-1')}",
+            description=(
+                f"**🛰️ Node:** `{v.get('node', 'Node-1')}` (`{v['ip']}:{v['ssh_port']}`)\n"
+                f"**📊 Resources:** `{v['ram_gb']}GB RAM` • `{v['cores']} vCPU` • `{v.get('disk_gb', 15)}GB Disk`\n"
+                f"**🌐 Access:** Click **🖥️ WebSSH Console** or **⚡ SSHX Link** below!"
+            ),
+            color=0x7C6AFF
+        )
+        embed.set_footer(text=footer_text())
+        await ctx.reply(embed=embed, view=VPSControlView(ctx.author.id, v))
 
 
 @bot.command(name="node-key")
@@ -239,7 +351,7 @@ async def cmd_node_add(ctx: commands.Context, node_name: str = None, ip: str = N
     ok_embed = discord.Embed(
         title="✅ Node Paired Successfully",
         description=f"**{node_name}** (`{ip}:{port}`) is now paired with **{bot.user.name}**!\n🐳 **Remote Docker Version:** `{result}`",
-        color=0x00FF88
+        color=0x2ECC71
     )
     ok_embed.set_footer(text=footer_text())
     await msg.edit(content=None, embed=ok_embed)
@@ -272,7 +384,7 @@ async def cmd_node_remove(ctx: commands.Context, node_name: str = None):
 @bot.command(name="nodes")
 async def cmd_nodes(ctx: commands.Context):
     nodes = get_nodes()
-    embed = discord.Embed(title=f"🌐 Registered Nodes — {bot.user.name}", color=0x00A8FF)
+    embed = discord.Embed(title=f"🌐 Registered Cluster Nodes — {bot.user.name}", color=0x00A8FF)
     for name, cfg in nodes.items():
         stats = await get_node_stats(name)
         role = "🏠 Primary Host" if cfg.get("is_local") else "🛰️ Worker Node"
@@ -292,68 +404,6 @@ async def cmd_nodes(ctx: commands.Context):
     await ctx.reply(embed=embed)
 
 
-@bot.command(name="deploy", aliases=["create-vps", "create"])
-async def cmd_deploy(ctx: commands.Context, member: discord.Member = None, ram_gb: int = DEFAULT_RAM_GB, cores: int = DEFAULT_CPU_CORES, disk_gb: int = DEFAULT_DISK_GB):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("❌ Only admins can deploy new VPS containers.")
-    target = member or ctx.author
-
-    async def on_node_picked(interaction: discord.Interaction, picked_node: str):
-        await interaction.response.edit_message(
-            content=f"⚙️ Deploying `{ram_gb}GB RAM / {cores} CPU` VPS for {target.mention} on **{picked_node}**...",
-            view=None
-        )
-        ok, vps_info, err = await create_vps_container(picked_node, target.id, ram_gb, cores, disk_gb)
-        if not ok:
-            return await interaction.edit_original_response(content=f"❌ Deployment failed on `{picked_node}`:\n`{err}`")
-
-        add_user_vps(target.id, vps_info)
-        bot_name = bot.user.name if bot.user else "FrostyHosting"
-        webssh = create_webssh_link(bot_name, vps_info, require_pin=True)
-        try:
-            dm_embed = discord.Embed(
-                title=f"🎉 Your VPS on {picked_node} is Ready!",
-                description=(
-                    f"**Node:** `{picked_node}`\n"
-                    f"**SSH Command:** `ssh root@{vps_info['ip']} -p {vps_info['ssh_port']}`\n"
-                    f"**Root Password:** `{vps_info['root_password']}`\n"
-                    f"**🖥️ Live WebSSH Link:** {webssh['url']}\n"
-                    f"**🛡️ WebSSH PIN:** `{webssh['pin']}`\n"
-                    f"**Specs:** `{ram_gb}GB RAM` | `{cores} vCPU` | `{disk_gb}GB Disk`"
-                ),
-                color=0x00FF88
-            )
-            dm_embed.set_footer(text=footer_text())
-            await target.send(embed=dm_embed)
-        except Exception:
-            pass
-
-        await interaction.edit_original_response(
-            content=f"✅ Deployed `{vps_info['container_name']}` on **{picked_node}** for {target.mention}! (SSH & WebSSH link sent via DM)",
-            view=VPSControlView(target.id, vps_info)
-        )
-
-    await ctx.reply(
-        f"❄ Choose which Node to host {target.mention}'s VPS (`{ram_gb}GB RAM / {cores} Cores`):",
-        view=NodeSelectView(ctx.author.id, on_node_picked)
-    )
-
-
-@bot.command(name="myvps", aliases=["vps"])
-async def cmd_myvps(ctx: commands.Context):
-    vps_list = get_user_vps(ctx.author.id)
-    if not vps_list:
-        return await ctx.reply("📭 You don't have any active VPS containers.")
-    for v in vps_list:
-        embed = discord.Embed(
-            title=f"🖥️ {v['container_name']} ({v.get('node', 'Node-1')})",
-            description=f"**SSH:** `ssh root@{v['ip']} -p {v['ssh_port']}`\n**Specs:** `{v['ram_gb']}GB RAM` / `{v['cores']} CPU`",
-            color=0x00A8FF
-        )
-        embed.set_footer(text=footer_text())
-        await ctx.reply(embed=embed, view=VPSControlView(ctx.author.id, v))
-
-
 @bot.command(name="vps-list", aliases=["allvps"])
 async def cmd_allvps(ctx: commands.Context):
     if not is_admin(ctx.author.id):
@@ -365,7 +415,7 @@ async def cmd_allvps(ctx: commands.Context):
             lines.append(f"• `{v['container_name']}` | Owner: <@{uid}> | Node: **{v.get('node')}** (`{v['ip']}:{v['ssh_port']}`)")
     if not lines:
         return await ctx.reply("📭 No VPS containers deployed yet.")
-    embed = discord.Embed(title="📋 All Deployed VPS Containers", description="\n".join(lines[:40]), color=0x00A8FF)
+    embed = discord.Embed(title="📋 All Active VPS Containers", description="\n".join(lines[:40]), color=0x7C6AFF)
     embed.set_footer(text=footer_text())
     await ctx.reply(embed=embed)
 
