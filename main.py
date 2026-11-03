@@ -6,6 +6,7 @@ from discord.ext import commands
 from config import (
     DISCORD_BOT_TOKEN,
     MAIN_ADMIN_ID,
+    WEBSSH_PORT,
     DEFAULT_RAM_GB,
     DEFAULT_CPU_CORES,
     DEFAULT_DISK_GB,
@@ -33,6 +34,7 @@ from docker_utils import (
     get_sshx_session
 )
 from views import HelpPaginatorView, NodeSelectView, OSSelectView, VPSControlView
+from webssh_server import handle_http_request, create_webssh_link, get_public_webssh_base
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -46,14 +48,18 @@ def is_admin(user_id: int) -> bool:
 
 def footer_text() -> str:
     bot_name = bot.user.name if bot.user else "ApexHosting"
-    return f"{bot_name} | Multi-Node VPS Manager • {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+    return f"{bot_name} | WebSSH & SSHX Cloud Manager • {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
 
 
 @bot.event
 async def on_ready():
     ensure_ssh_key()
     get_nodes()
+    bot.loop.create_task(
+        asyncio.start_server(lambda r, w: handle_http_request(r, w, bot), "0.0.0.0", WEBSSH_PORT)
+    )
     print(f"[✓] Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"[✓] WebSSH listening on 0.0.0.0:{WEBSSH_PORT} -> Public URL: {get_public_webssh_base()}")
 
 
 @bot.command(name="help", aliases=["commands", "h"])
@@ -65,7 +71,17 @@ async def cmd_help(ctx: commands.Context):
 
 @bot.command(name="ping")
 async def cmd_ping(ctx: commands.Context):
-    await ctx.reply(f"🏓 Pong! Latency: `{round(bot.latency * 1000)}ms`")
+    embed = discord.Embed(
+        title="🏓 Gateway & Tunnel Status",
+        description=(
+            f"**Discord Latency:** `{round(bot.latency * 1000)}ms`\n"
+            f"**WebSSH Endpoint:** `{get_public_webssh_base()}`\n"
+            f"**Local Listener Port:** `{WEBSSH_PORT}`"
+        ),
+        color=0x2ECC71
+    )
+    embed.set_footer(text=footer_text())
+    await ctx.reply(embed=embed)
 
 
 @bot.command(name="webssh", aliases=["console", "terminal"])
@@ -190,33 +206,9 @@ async def cmd_buy(ctx: commands.Context, plan_name: str = None):
 
             await node_interaction.edit_original_response(content=f"✅ Provisioned `{vps_info['container_name']}`! Details sent to DMs.", view=VPSControlView(ctx.author.id, vps_info))
 
-        await interaction.response.edit_message(content=f"❄ Select node for your **{vps_info_label if 'vps_info_label' in locals() else matched}** VPS:", view=NodeSelectView(ctx.author.id, on_node_picked))
+        await interaction.response.edit_message(content=f"❄ Select Node for **{matched}**:", view=NodeSelectView(ctx.author.id, on_node_picked))
 
-    async def on_os_picked_real(interaction: discord.Interaction, picked_os: str):
-        async def on_node_picked_real(node_interaction: discord.Interaction, picked_node: str):
-            if get_credits(ctx.author.id) < plan["price"]:
-                return await node_interaction.response.edit_message(content="❌ Insufficient credits.", view=None)
-            add_credits(ctx.author.id, -plan["price"])
-            await node_interaction.response.edit_message(content=f"⚙️ Provisioning **{matched}** on **{picked_node}**...", view=None)
-            ok, vps_info, err = await create_vps_container(picked_node, ctx.author.id, plan["ram"], plan["cpu"], plan["disk"], picked_os)
-            if not ok:
-                add_credits(ctx.author.id, plan["price"])
-                return await node_interaction.edit_original_response(content=f"❌ Failed: `{err}`")
-
-            add_user_vps(ctx.author.id, vps_info)
-            sshx_ok, sshx_url = await get_sshx_session(picked_node, vps_info["container_name"])
-            sshx_line = sshx_url if sshx_ok else "Click **⚡ SSHX Link** in `!myvps`"
-
-            try:
-                dm_embed = discord.Embed(title=f"🎉 Your {matched} VPS is Ready!", description=f"**Password:** `{vps_info['root_password']}`\n**SSHX:** {sshx_line}", color=0x2ECC71)
-                await ctx.author.send(embed=dm_embed)
-            except Exception:
-                pass
-            await node_interaction.edit_original_response(content=f"✅ Deployed `{vps_info['container_name']}`!", view=VPSControlView(ctx.author.id, vps_info))
-
-        await interaction.response.edit_message(content=f"❄ Select Node for **{matched}**:", view=NodeSelectView(ctx.author.id, on_node_picked_real))
-
-    await ctx.reply("🐧 Choose your Operating System:", view=OSSelectView(ctx.author.id, on_os_picked_real))
+    await ctx.reply("🐧 Choose your Operating System:", view=OSSelectView(ctx.author.id, on_os_picked))
 
 
 @bot.command(name="create", aliases=["deploy", "create-vps"])
