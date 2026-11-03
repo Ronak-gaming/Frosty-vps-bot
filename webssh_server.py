@@ -5,7 +5,6 @@ import os
 import pty
 import random
 import secrets
-import shlex
 import signal
 import struct
 import termios
@@ -13,20 +12,25 @@ import time
 from urllib.parse import parse_qs, urlparse
 
 from config import (
+    BOT_DIR,
     BOT_VERSION,
     DISCORD_BOT_TOKEN,
     SERVER_PUBLIC_IP,
+    WEBSSH_BASE_URL,
     WEBSSH_HTML_PATH,
     WEBSSH_PORT
 )
 from docker_utils import ensure_ssh_key
-from storage import register_node
+from storage import get_nodes, register_node
 
-# Token store: token -> {host, port, username, password, label, pin, unlock_key, attempts, created_at}
 WEBSSH_TOKENS = {}
-
-# Active PTY sessions: session_id -> {master_fd, pid, buffer, closed, created_at}
 SSH_SESSIONS = {}
+
+
+def get_public_webssh_base() -> str:
+    if WEBSSH_BASE_URL and WEBSSH_BASE_URL.startswith("http"):
+        return WEBSSH_BASE_URL.rstrip("/")
+    return f"http://{SERVER_PUBLIC_IP}:{WEBSSH_PORT}"
 
 
 def create_webssh_link(bot_name: str, vps_info: dict, require_pin: bool = True) -> dict:
@@ -34,9 +38,19 @@ def create_webssh_link(bot_name: str, vps_info: dict, require_pin: bool = True) 
     pin = f"{random.randint(100000, 999999)}" if require_pin else ""
     unlock_key = secrets.token_hex(16)
 
+    # Determine internal/private connection IP so NAT / Private IPv4 nodes always connect
+    node_name = vps_info.get("node", "Node-1")
+    nodes = get_nodes()
+    node_cfg = nodes.get(node_name, {})
+    if node_cfg.get("is_local", True):
+        connect_host = "127.0.0.1"
+    else:
+        connect_host = node_cfg.get("ip") or vps_info.get("ip", "127.0.0.1")
+
     WEBSSH_TOKENS[token] = {
         "bot_name": bot_name,
-        "host": vps_info.get("ip", SERVER_PUBLIC_IP),
+        "host": connect_host,
+        "display_host": vps_info.get("ip", connect_host),
         "port": int(vps_info.get("ssh_port", 22)),
         "username": "root",
         "password": vps_info.get("root_password", ""),
@@ -48,21 +62,20 @@ def create_webssh_link(bot_name: str, vps_info: dict, require_pin: bool = True) 
         "created_at": time.time()
     }
 
-    url = f"http://{SERVER_PUBLIC_IP}:{WEBSSH_PORT}/ssh/{token}"
-    return {"url": url, "pin": pin, "token": token}
+    base_url = get_public_webssh_base()
+    url = f"{base_url}/ssh/{token}"
+    return {"url": url, "pin": pin, "token": token, "base_url": base_url}
 
 
 def _start_pty_ssh(host: str, port: int, username: str, password: str) -> str:
     session_id = secrets.token_hex(16)
     master_fd, slave_fd = pty.openpty()
 
-    # Set default terminal size 100x30
     winsize = struct.pack("HHHH", 30, 100, 0, 0)
     fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
 
     pid = os.fork()
     if pid == 0:
-        # Child process
         os.setsid()
         os.dup2(slave_fd, 0)
         os.dup2(slave_fd, 1)
@@ -209,9 +222,20 @@ async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.Stre
         parsed = urlparse(full_path)
         path = parsed.path
         qs = parse_qs(parsed.query)
-        bot_name = bot_ref.user.name if getattr(bot_ref, "user", None) else "FrostyHosting"
+        bot_name = bot_ref.user.name if getattr(bot_ref, "user", None) else "ApexHosting"
 
-        # 1. Serve WebSSH HTML UI
+        # Serve static xterm.js assets from /opt/Frosty-vps-bot/static/
+        if method == "GET" and path.startswith("/static/"):
+            fname = os.path.basename(path)
+            fpath = os.path.join(BOT_DIR, "static", fname)
+            if os.path.isfile(fpath):
+                ctype = "text/css" if fname.endswith(".css") else "application/javascript"
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as sf:
+                    _send_http(writer, "200 OK", ctype, sf.read())
+                await writer.drain()
+                return
+
+        # Serve WebSSH HTML UI
         if method == "GET" and (path == "/" or path == "/ssh" or path.startswith("/ssh/")):
             token = ""
             if path.startswith("/ssh/"):
@@ -223,7 +247,6 @@ async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.Stre
             await writer.drain()
             return
 
-        # Parse JSON body for POST endpoints
         payload = {}
         if method == "POST" and body.strip():
             try:
@@ -231,7 +254,6 @@ async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.Stre
             except Exception:
                 payload = {}
 
-        # 2. Node Auto-Pairing Endpoint (/pair)
         if method == "POST" and path == "/pair":
             req_token = payload.get("token", "").strip()
             node_name = payload.get("node_name", "Node-2").strip()
@@ -255,7 +277,6 @@ async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.Stre
             await writer.drain()
             return
 
-        # 3. WebSSH API: Unlock PIN (/api/ssh/unlock)
         if method == "POST" and path == "/api/ssh/unlock":
             token = payload.get("token", "")
             pin = str(payload.get("pin", "")).strip()
@@ -272,7 +293,6 @@ async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.Stre
             await writer.drain()
             return
 
-        # 4. WebSSH API: Connect (/api/ssh/connect)
         if method == "POST" and path == "/api/ssh/connect":
             token = payload.get("token", "")
             unlock_key = payload.get("unlock_key", "")
@@ -287,6 +307,11 @@ async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.Stre
                     _send_http(writer, "200 OK", "application/json", json.dumps({"success": False, "code": "pin_required"}))
                     await writer.drain()
                     return
+                # Always use the token's verified internal/private routing host
+                host = t_info["host"]
+                port = int(t_info["port"])
+                username = t_info["username"]
+                password = t_info["password"]
 
             session_id = _start_pty_ssh(host, port, username, password)
             await asyncio.sleep(0.4)
@@ -294,7 +319,6 @@ async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.Stre
             await writer.drain()
             return
 
-        # 5. WebSSH API: Read (/api/ssh/read)
         if method == "POST" and path == "/api/ssh/read":
             session_id = payload.get("session_id", "")
             last_idx = int(payload.get("last_index", 0))
@@ -313,7 +337,6 @@ async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.Stre
             await writer.drain()
             return
 
-        # 6. WebSSH API: Write (/api/ssh/write)
         if method == "POST" and path == "/api/ssh/write":
             session_id = payload.get("session_id", "")
             data = payload.get("data", "")
@@ -327,7 +350,6 @@ async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.Stre
             await writer.drain()
             return
 
-        # 7. WebSSH API: Resize (/api/ssh/resize)
         if method == "POST" and path == "/api/ssh/resize":
             session_id = payload.get("session_id", "")
             cols = int(payload.get("cols", 100))
@@ -343,7 +365,6 @@ async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.Stre
             await writer.drain()
             return
 
-        # 8. WebSSH API: Disconnect (/api/ssh/disconnect)
         if method == "POST" and path == "/api/ssh/disconnect":
             session_id = payload.get("session_id", "")
             _close_pty_session(session_id)
