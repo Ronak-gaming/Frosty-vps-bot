@@ -146,18 +146,19 @@ async def create_vps_container(node_name: str, user_id: int, ram_gb: int, cores:
     root_pass = f"Frosty@{random.randint(100000, 999999)}"
     container_name = f"vps-{user_id}-{random.randint(1000, 9999)}"
 
-    # Automatically clamp --cpus to the host's actual CPU count (nproc) so 1-CPU nodes like Tcodes NEVER fail!
     setup_cmd = (
         f"HOST_CPUS=$(nproc 2>/dev/null || echo 1); "
         f"REQ_CPUS={cores}; "
         f"if [ \"$REQ_CPUS\" -gt \"$HOST_CPUS\" ]; then USE_CPUS=\"$HOST_CPUS\"; else USE_CPUS=\"$REQ_CPUS\"; fi; "
         f"docker run -d --name {container_name} --hostname {container_name} "
         f"--memory={ram_gb}g --cpus=\"$USE_CPUS\" -p {ssh_port}:22 --restart unless-stopped {DOCKER_IMAGE} "
-        f"bash -c \"apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server sudo curl wget nano tmate neofetch && "
+        f"bash -c \"mkdir -p /var/cache/apt/tmp && TMPDIR=/var/cache/apt/tmp apt-get update && "
+        f"TMPDIR=/var/cache/apt/tmp DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server sudo curl wget nano tmate ca-certificates && "
         f"mkdir -p /run/sshd && echo 'root:{root_pass}' | chpasswd && "
+        f"rm -f /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true && "
         f"sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && "
         f"sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && "
-        f"/usr/sbin/sshd -D\""
+        f"ssh-keygen -A && /usr/sbin/sshd -D\""
     )
 
     rc, out, err = await run_node_cmd(node_name, setup_cmd, timeout=180)
