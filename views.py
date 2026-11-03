@@ -1,7 +1,6 @@
 import discord
-from datetime import datetime
 from typing import Callable, Awaitable, List
-from config import BOT_VERSION, WEBSSH_BASE_URL
+from config import BOT_VERSION, OS_IMAGES
 from storage import get_nodes, delete_user_vps, update_user_vps
 from docker_utils import (
     manage_container_power,
@@ -9,155 +8,88 @@ from docker_utils import (
     get_sshx_session,
     reset_container_password
 )
-from webssh_server import create_webssh_link, get_public_webssh_base
+
+
+class OSSelectDropdown(discord.ui.Select):
+    def __init__(self, callback_fn: Callable[[discord.Interaction, str], Awaitable[None]]):
+        options = []
+        for key, info in OS_IMAGES.items():
+            options.append(discord.SelectOption(label=info["label"], value=key))
+        super().__init__(placeholder="🐧 Select Operating System...", min_values=1, max_values=1, options=options)
+        self.callback_fn = callback_fn
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.callback_fn(interaction, self.values[0])
+
+
+class OSSelectView(discord.ui.View):
+    def __init__(self, author_id: int, callback_fn: Callable[[discord.Interaction, str], Awaitable[None]]):
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.add_item(OSSelectDropdown(callback_fn))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ This menu isn't for you.", ephemeral=True)
+            return False
+        return True
 
 
 class HelpPaginatorView(discord.ui.View):
-    def __init__(self, author_id: int, bot_name: str, avatar_url: str = None):
+    def __init__(self, author_id: int, bot_name: str):
         super().__init__(timeout=240)
         self.author_id = author_id
         self.bot_name = bot_name
-        self.avatar_url = avatar_url
         self.current_page = 0
         self.pages = self._build_pages()
 
     def _build_pages(self) -> List[discord.Embed]:
-        webssh_domain = get_public_webssh_base()
-        footer = f"{self.bot_name} v{BOT_VERSION} • Cloud & Private IPv4 Multi-Node Infrastructure"
-
-        # Page 1: Instance & Console Management
+        footer = f"{self.bot_name} v{BOT_VERSION} • Multi-Node Cloud Infrastructure"
         p1 = discord.Embed(
-            title=f"⚡ {self.bot_name} — Command Center",
-            description=(
-                f"> **Welcome to {self.bot_name}!** Manage your high-performance containers with instant "
-                f"**Cloudflare WebSSH** (`{webssh_domain}`) and **SSHX** browser terminals.\n\n"
-                f"### 🖥️ Instance & Console Commands"
-            ),
+            title=f"⚡ {self.bot_name} — Help Menu (1/4: Instances & SSHX)",
+            description="Manage your containers, run automated post-setup updates, and open **SSHX** browser terminals.",
             color=0x7C6AFF
         )
-        p1.add_field(
-            name="🔹 `!myvps` *(or `!vps`)*",
-            value="Open the live interactive dashboard for your instances (**Start**, **Stop**, **Restart**, **WebSSH**, **SSHX**, **Reset Pass**, **Delete**).",
-            inline=False
-        )
-        p1.add_field(
-            name="🔹 `!webssh` *(or `!console`)*",
-            value=f"Generate a PIN-protected **Live Browser WebSSH** session via `{webssh_domain}` (Works on Private IPv4 & NAT).",
-            inline=False
-        )
-        p1.add_field(
-            name="🔹 `!sshx`",
-            value="Spawn an instant, encrypted **sshx.io** collaborative browser terminal link for your VPS.",
-            inline=False
-        )
-        p1.add_field(
-            name="🔹 `!plans` & `!buy <Plan>`",
-            value="Browse available hardware tiers and deploy an instance automatically using your credits.",
-            inline=False
-        )
-        p1.set_footer(text=f"{footer} • Page 1 of 4")
+        p1.add_field(name="`!myvps` *(or `!vps`)*", value="Open live interactive controls (**Start**, **Stop**, **Restart**, **SSHX Link**, **Reset Pass**, **Delete**).", inline=False)
+        p1.add_field(name="`!sshx`", value="Generate an instant **sshx.io** web terminal session.", inline=False)
+        p1.add_field(name="`!webssh` *(or `!console`)*", value="🔔 *WebSSH browser console is **Coming Soon**! Use `!sshx` in the meantime.*", inline=False)
+        p1.add_field(name="`!create [@user] [ram] [cpu] [disk]`", value="Provision a new container with automated OS selection (Ubuntu 22-26 / Debian 11-13).", inline=False)
+        p1.set_footer(text=f"{footer} • Page 1/4")
 
-        # Page 2: Billing & Credits Economy
         p2 = discord.Embed(
-            title=f"💎 {self.bot_name} — Credits & Storefront",
-            description=(
-                "> **Instant Cloud Provisioning:** Check your balance, transfer credits to teammates, "
-                "and upgrade your container specifications.\n\n"
-                "### 💰 Economy Commands"
-            ),
+            title=f"💎 {self.bot_name} — Help Menu (2/4: Credits & Plans)",
+            description="Inspect balances, transfer credits, and shop hardware tiers.",
             color=0x2ECC71
         )
-        p2.add_field(
-            name="🔹 `!credits [@user]` *(or `!bal`)*",
-            value="Inspect your current credit wallet or view another member's balance.",
-            inline=False
-        )
-        p2.add_field(
-            name="🔹 `!pay <@user> <amount>`",
-            value="Securely transfer credits from your wallet to another Discord member.",
-            inline=False
-        )
-        p2.add_field(
-            name="🔹 `!plans` *(or `!shop`)*",
-            value="Display all VPS packages (`Starter`, `Basic`, `Pro`, `Ultra`) with RAM, vCPU, and Disk allocations.",
-            inline=False
-        )
-        p2.add_field(
-            name="🔹 `!ping`",
-            value="Check gateway latency, WebSSH tunnel status, and cluster responsiveness.",
-            inline=False
-        )
-        p2.set_footer(text=f"{footer} • Page 2 of 4")
+        p2.add_field(name="`!credits` / `!bal` [@user]", value="Check credit wallet balance.", inline=False)
+        p2.add_field(name="`!pay <@user> <amount>`", value="Transfer credits to other users.", inline=False)
+        p2.add_field(name="`!plans` / `!shop`", value="Display all available VPS plans.", inline=False)
+        p2.set_footer(text=f"{footer} • Page 2/4")
 
-        # Page 3: Multi-Node Cluster Management
         p3 = discord.Embed(
-            title=f"🛰️ {self.bot_name} — Multi-Node Cluster",
-            description=(
-                "> **Distributed Cluster Control:** Pair unlimited Public or Private IPv4 worker nodes "
-                "and monitor real-time CPU, RAM, and container telemetry.\n\n"
-                "### 🌐 Cluster & Node Commands"
-            ),
+            title=f"🛰️ {self.bot_name} — Help Menu (3/4: Cluster Nodes)",
+            description="Manage worker nodes and cluster telemetry.",
             color=0x00A8FF
         )
-        p3.add_field(
-            name="🔹 `!nodes`",
-            value="Live health check of all paired nodes (`Node-1`, `Node-2`, etc.) with CPU cores, memory load, and active containers.",
-            inline=False
-        )
-        p3.add_field(
-            name="🔹 `!node-add <Name> <IP> <Port> [Pass|KEY_ONLY]`",
-            value="Pair a remote Public or Private IPv4 worker node directly to the cluster.",
-            inline=False
-        )
-        p3.add_field(
-            name="🔹 `!node-rename <OldName> <NewName>`",
-            value="Rename a registered node and automatically migrate all linked container records.",
-            inline=False
-        )
-        p3.add_field(
-            name="🔹 `!node-remove <Name>` & `!node-key`",
-            value="Detach a worker node or display the master Ed25519 SSH public key.",
-            inline=False
-        )
-        p3.set_footer(text=f"{footer} • Page 3 of 4")
+        p3.add_field(name="`!nodes`", value="View live CPU, RAM, and container metrics for all paired nodes.", inline=False)
+        p3.add_field(name="`!node-add <Name> <IP> <Port> [Pass|KEY_ONLY]`", value="Pair a remote worker node.", inline=False)
+        p3.set_footer(text=f"{footer} • Page 3/4")
 
-        # Page 4: Administrator & Staff Controls
         p4 = discord.Embed(
-            title=f"🛡️ {self.bot_name} — Administrator Suite",
-            description=(
-                "> **Staff & Root Operations:** Provision custom containers on any node, audit active VPS instances, "
-                "and manage staff privileges.\n\n"
-                "### ⚙️ Provisioning & Admin Commands"
-            ),
+            title=f"🛡️ {self.bot_name} — Help Menu (4/4: Administration)",
+            description="Staff tools and credit minting.",
             color=0xF0B34B
         )
-        p4.add_field(
-            name="🔹 `!create <@user> [ram_gb] [cores] [disk_gb]`",
-            value="Provision a custom VPS container on any node via interactive dropdown (Auto-sends WebSSH + SSHX access in DM).",
-            inline=False
-        )
-        p4.add_field(
-            name="🔹 `!vps-list` *(or `!allvps`)*",
-            value="Audit all running containers across every user and node in the cluster.",
-            inline=False
-        )
-        p4.add_field(
-            name="🔹 `!addcredits <@user> <amount>` / `!removecredits <@user> <amount>`",
-            value="Mint or deduct credits from any user's account balance.",
-            inline=False
-        )
-        p4.add_field(
-            name="🔹 `!admin-add <@user>` / `!admin-remove <@user>`",
-            value="Grant or revoke bot administrator permissions (Main Owner only).",
-            inline=False
-        )
-        p4.set_footer(text=f"{footer} • Page 4 of 4")
+        p4.add_field(name="`!create`", value="Provision containers as an admin.", inline=False)
+        p4.add_field(name="`!vps-list` / `!allvps`", value="Audit all active containers cluster-wide.", inline=False)
+        p4.add_field(name="`!addcredits` / `!removecredits`", value="Manage user wallet balances.", inline=False)
+        p4.set_footer(text=f"{footer} • Page 4/4")
 
         return [p1, p2, p3, p4]
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message("❌ Run `!help` yourself to navigate this menu.", ephemeral=True)
+            await interaction.response.send_message("❌ Not your menu.", ephemeral=True)
             return False
         return True
 
@@ -197,15 +129,9 @@ class NodeSelectDropdown(discord.ui.Select):
         nodes = get_nodes()
         options = []
         for name, cfg in list(nodes.items())[:25]:
-            kind = "Primary Host (Private/Local)" if cfg.get("is_local") else "Worker Node"
-            options.append(
-                discord.SelectOption(
-                    label=name,
-                    description=f"{kind} • {cfg.get('ip')}:{cfg.get('ssh_port', 22)}",
-                    value=name
-                )
-            )
-        super().__init__(placeholder="❄ Select a Node to provision this VPS on...", min_values=1, max_values=1, options=options)
+            kind = "Primary Host" if cfg.get("is_local") else "Worker Node"
+            options.append(discord.SelectOption(label=name, description=f"{kind} • {cfg.get('ip')}", value=name))
+        super().__init__(placeholder="❄ Select Node...", min_values=1, max_values=1, options=options)
         self.callback_fn = callback_fn
 
     async def callback(self, interaction: discord.Interaction):
@@ -218,12 +144,6 @@ class NodeSelectView(discord.ui.View):
         self.author_id = author_id
         self.add_item(NodeSelectDropdown(callback_fn))
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message("❌ This dropdown isn't for you.", ephemeral=True)
-            return False
-        return True
-
 
 class VPSControlView(discord.ui.View):
     def __init__(self, owner_id: int, vps_info: dict):
@@ -233,7 +153,7 @@ class VPSControlView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("❌ Only the VPS owner can use these controls.", ephemeral=True)
+            await interaction.response.send_message("❌ Owner only.", ephemeral=True)
             return False
         return True
 
@@ -255,35 +175,16 @@ class VPSControlView(discord.ui.View):
         ok, msg = await manage_container_power(self.vps["node"], self.vps["container_name"], "restart")
         await interaction.followup.send(f"{'🔄 Restarted' if ok else '❌ Failed'}: `{msg}`", ephemeral=True)
 
-    @discord.ui.button(label="WebSSH Console", style=discord.ButtonStyle.primary, emoji="🖥️", row=1)
+    @discord.ui.button(label="WebSSH (Coming Soon)", style=discord.ButtonStyle.secondary, emoji="⏳", row=1, disabled=True)
     async def webssh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        bot_name = interaction.client.user.name if interaction.client.user else "ApexHosting"
-        session = create_webssh_link(bot_name, self.vps, require_pin=True)
-        embed = discord.Embed(
-            title=f"🖥️ Cloudflare WebSSH Console — {self.vps['container_name']}",
-            description=(
-                f"**🔗 Launch Live Console:**\n{session['url']}\n\n"
-                f"**🛡️ Security Unlock PIN:** `{session['pin']}`\n"
-                f"**🛰️ Node:** `{self.vps.get('node', 'Node-1')}` *(Private IPv4 Tunnel Active)*"
-            ),
-            color=0x7C6AFF
-        )
-        try:
-            await interaction.user.send(embed=embed)
-        except Exception:
-            pass
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        pass
 
     @discord.ui.button(label="SSHX Link", style=discord.ButtonStyle.success, emoji="⚡", row=1)
     async def sshx_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         ok, url = await get_sshx_session(self.vps["node"], self.vps["container_name"])
         if ok:
-            embed = discord.Embed(
-                title=f"⚡ SSHX Live Web Terminal — {self.vps['container_name']}",
-                description=f"**🔗 Click to Open SSHX Terminal:**\n{url}\n\n*Works instantly across Private IPv4 & NAT!*",
-                color=0x2ECC71
-            )
+            embed = discord.Embed(title=f"⚡ SSHX Terminal — {self.vps['container_name']}", description=f"**🔗 Click to Open:**\n{url}", color=0x2ECC71)
             try:
                 await interaction.user.send(embed=embed)
             except Exception:
@@ -292,40 +193,20 @@ class VPSControlView(discord.ui.View):
         else:
             await interaction.followup.send(f"❌ SSHX failed: `{url}`", ephemeral=True)
 
-    @discord.ui.button(label="Tmate", style=discord.ButtonStyle.secondary, emoji="🌐", row=1)
-    async def tmate_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        ok, session = await get_tmate_session(self.vps["node"], self.vps["container_name"])
-        if ok:
-            await interaction.followup.send(f"🌐 **Tmate SSH Session:**\n```bash\n{session}\n```", ephemeral=True)
-        else:
-            await interaction.followup.send(f"❌ Tmate failed: `{session}`", ephemeral=True)
-
     @discord.ui.button(label="SSH Info", style=discord.ButtonStyle.secondary, emoji="💻", row=2)
     async def ssh_info_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
-            f"**Internal / Node SSH (`{self.vps['node']}`):**\n"
+            f"**SSH Connection (`{self.vps['node']}`):**\n"
             f"```bash\nssh root@{self.vps['ip']} -p {self.vps['ssh_port']}\n```\n"
-            f"**Root Password:** `{self.vps['root_password']}`\n"
-            f"*Tip: Since this node uses Private IPv4, use **🖥️ WebSSH Console** or **⚡ SSHX Link** for direct browser access!*",
+            f"**Password:** `{self.vps['root_password']}`\n"
+            f"**OS:** `{self.vps.get('os_label', 'Ubuntu')}`",
             ephemeral=True
         )
-
-    @discord.ui.button(label="Reset Password", style=discord.ButtonStyle.secondary, emoji="🔑", row=2)
-    async def pass_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        ok, new_pass = await reset_container_password(self.vps["node"], self.vps["container_name"])
-        if ok:
-            self.vps["root_password"] = new_pass
-            update_user_vps(self.owner_id, self.vps["container_name"], {"root_password": new_pass})
-            await interaction.followup.send(f"🔑 **New Root Password:** `{new_pass}`", ephemeral=True)
-        else:
-            await interaction.followup.send(f"❌ Failed: `{new_pass}`", ephemeral=True)
 
     @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️", row=2)
     async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         await manage_container_power(self.vps["node"], self.vps["container_name"], "rm -f")
         delete_user_vps(self.owner_id, self.vps["container_name"])
-        await interaction.followup.send(f"🗑️ Deleted `{self.vps['container_name']}` from `{self.vps['node']}`.", ephemeral=True)
+        await interaction.followup.send(f"🗑️ Deleted `{self.vps['container_name']}`.", ephemeral=True)
         self.stop()
