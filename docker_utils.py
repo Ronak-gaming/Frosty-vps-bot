@@ -19,11 +19,22 @@ def ensure_ssh_key() -> str:
     return ""
 
 
-async def run_node_cmd(node_name: str, command: str, timeout: int = 120) -> Tuple[int, str, str]:
+def _resolve_node(node_name: str) -> Dict[str, Any]:
     nodes = get_nodes()
-    node = nodes.get(node_name)
-    if not node:
-        return 1, "", f"Node '{node_name}' not found in nodes_data.json"
+    if node_name in nodes:
+        return nodes[node_name]
+    for k, v in nodes.items():
+        if k.lower() == (node_name or "").lower():
+            return v
+    # Auto-fallback to primary local node if old container references an unconfigured node like cuba32
+    for k, v in nodes.items():
+        if isinstance(v, dict) and v.get("is_local"):
+            return v
+    return {"name": node_name or "Node-1", "is_local": True, "ip": "127.0.0.1", "ssh_port": 22, "user": "root"}
+
+
+async def run_node_cmd(node_name: str, command: str, timeout: int = 180) -> Tuple[int, str, str]:
+    node = _resolve_node(node_name)
 
     if node.get("is_local"):
         proc = await asyncio.create_subprocess_shell(
@@ -59,32 +70,64 @@ async def run_node_cmd(node_name: str, command: str, timeout: int = 120) -> Tupl
 async def pair_remote_node(node_name: str, ip: str, port: int, password_or_mode: str = "KEY_ONLY") -> Tuple[bool, str]:
     pub_key = ensure_ssh_key()
     clean_arg = (password_or_mode or "KEY_ONLY").strip()
-    is_key_mode = clean_arg.upper() == "KEY_ONLY" or clean_arg.startswith("ssh-ed25519") or clean_arg == ""
+    is_key_mode = (
+        clean_arg.upper() == "KEY_ONLY"
+        or clean_arg.startswith("ssh-ed25519")
+        or clean_arg.startswith("ssh-rsa")
+        or clean_arg == ""
+    )
 
-    remote_script = (
-        f"mkdir -p /root/.ssh && chmod 700 /root/.ssh && "
-        f"echo '{pub_key}' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && "
+    remote_setup_script = (
+        f"chown root:root /root && chmod 700 /root && "
+        f"mkdir -p /run/sshd /root/.ssh && chmod 700 /root/.ssh && "
+        f"touch /root/.ssh/authorized_keys && "
+        f"(grep -qxF '{pub_key}' /root/.ssh/authorized_keys 2>/dev/null || echo '{pub_key}' >> /root/.ssh/authorized_keys) && "
+        f"chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root/.ssh && "
+        f"rm -f /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true && "
+        f"sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null || true && "
+        f"sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true && "
+        f"sed -i 's/^#*StrictModes.*/StrictModes no/' /etc/ssh/sshd_config 2>/dev/null || true && "
+        f"(systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || service ssh restart 2>/dev/null || pkill -HUP sshd 2>/dev/null || /usr/sbin/sshd 2>/dev/null || true) && "
         f"docker info --format '{{{{.ServerVersion}}}}'"
     )
+
     if not is_key_mode:
         env = os.environ.copy()
         env["SSHPASS"] = clean_arg
-        cmd = f"sshpass -e ssh -p {int(port)} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{shlex.quote(ip)} {shlex.quote(remote_script)}"
-        proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
+        cmd = (
+            f"sshpass -e ssh -p {int(port)} "
+            f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+            f"-o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive "
+            f"-o LogLevel=ERROR -o ConnectTimeout=15 "
+            f"root@{shlex.quote(ip)} {shlex.quote(remote_setup_script)}"
+        )
+        proc = await asyncio.create_subprocess_shell(
+            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env
+        )
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
-            return False, stderr.decode(errors="ignore").strip() or "Auth failed"
+            return False, stderr.decode(errors="ignore").strip() or "SSH password login failed"
 
-    verify_cmd = f"ssh -i {shlex.quote(SSH_KEY_PATH)} -p {int(port)} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes root@{shlex.quote(ip)} \"docker info --format '{{{{.ServerVersion}}}}'\""
-    proc = await asyncio.create_subprocess_shell(verify_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    verify_cmd = (
+        f"ssh -i {shlex.quote(SSH_KEY_PATH)} -p {int(port)} "
+        f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+        f"-o IdentitiesOnly=yes -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=12 "
+        f"root@{shlex.quote(ip)} \"docker info --format '{{{{.ServerVersion}}}}'\""
+    )
+    proc = await asyncio.create_subprocess_shell(
+        verify_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
-        return False, stderr.decode(errors="ignore").strip() or "Key check failed"
+        return False, stderr.decode(errors="ignore").strip() or "Permission denied (publickey)"
     return True, stdout.decode(errors="ignore").strip() or "unknown"
 
 
 async def get_node_stats(node_name: str) -> Dict[str, Any]:
-    cmd = "echo \"$(nproc)|$(free -m | awk '/Mem:/ {print $3\"/\"$2\" MB\"}')|$(uptime -p 2>/dev/null || echo 'up')|$(docker ps -q 2>/dev/null | wc -l)\""
+    cmd = (
+        "echo \"$(nproc)|$(free -m | awk '/Mem:/ {print $3\"/\"$2\" MB\"}')|"
+        "$(uptime -p 2>/dev/null || echo 'up')|$(docker ps -q 2>/dev/null | wc -l)\""
+    )
     rc, out, err = await run_node_cmd(node_name, cmd, timeout=12)
     if rc != 0 or "|" not in out:
         return {"online": False, "error": err or "Unreachable"}
@@ -99,10 +142,8 @@ async def get_node_stats(node_name: str) -> Dict[str, Any]:
 
 
 async def create_vps_container(node_name: str, user_id: int, ram_gb: int, cores: int, disk_gb: int, os_key: str = "ubuntu-22.04") -> Tuple[bool, Dict[str, Any], str]:
-    nodes = get_nodes()
-    node = nodes.get(node_name)
-    if not node:
-        return False, {}, f"Node `{node_name}` does not exist."
+    node = _resolve_node(node_name)
+    actual_node_name = node.get("name", node_name)
 
     os_info = OS_IMAGES.get(os_key, OS_IMAGES["ubuntu-22.04"])
     docker_image = os_info["image"]
@@ -111,65 +152,84 @@ async def create_vps_container(node_name: str, user_id: int, ram_gb: int, cores:
     root_pass = f"Frosty@{random.randint(100000, 999999)}"
     container_name = f"vps-{user_id}-{random.randint(1000, 9999)}"
 
-    # Post setup script: apt update && apt upgrade + neofetch (fallback screenfetch) + sshx
     setup_cmd = (
         f"HOST_CPUS=$(nproc 2>/dev/null || echo 1); "
         f"REQ_CPUS={cores}; "
         f"if [ \"$REQ_CPUS\" -gt \"$HOST_CPUS\" ]; then USE_CPUS=\"$HOST_CPUS\"; else USE_CPUS=\"$REQ_CPUS\"; fi; "
         f"docker run -d --name {container_name} --hostname {container_name} "
         f"--memory={ram_gb}g --cpus=\"$USE_CPUS\" -p 0.0.0.0:{ssh_port}:22 --restart unless-stopped {docker_image} "
-        f"bash -c \"export DEBIAN_FRONTEND=noninteractive; "
-        f"mkdir -p /var/cache/apt/tmp; "
-        f"apt-get update -y && apt-get upgrade -y && "
-        f"apt-get install -y --no-install-recommends openssh-server sudo curl wget nano ca-certificates || true; "
-        f"(apt-get install -y neofetch || apt-get install -y screenfetch || true); "
-        f"(curl -sSf https://sshx.io/get | sh >/dev/null 2>&1 || true); "
-        f"mkdir -p /run/sshd && echo 'root:{root_pass}' | chpasswd && "
+        f"bash -c \"sleep infinity\" && "
+        f"docker exec {container_name} bash -c \""
+        f"export DEBIAN_FRONTEND=noninteractive; "
+        f"mkdir -p /var/cache/apt/tmp /run/sshd; "
+        f"TMPDIR=/var/cache/apt/tmp apt-get update -y && "
+        f"TMPDIR=/var/cache/apt/tmp apt-get upgrade -y && "
+        f"TMPDIR=/var/cache/apt/tmp apt-get install -y --no-install-recommends openssh-server sudo curl wget nano tmate ca-certificates procps && "
+        f"(TMPDIR=/var/cache/apt/tmp apt-get install -y --no-install-recommends neofetch || TMPDIR=/var/cache/apt/tmp apt-get install -y --no-install-recommends screenfetch || true) && "
+        f"(curl -sSf https://sshx.io/get | sh >/dev/null 2>&1 || true) && "
+        f"echo 'root:{root_pass}' | chpasswd && "
         f"rm -f /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true && "
         f"sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && "
         f"sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && "
-        f"ssh-keygen -A && /usr/sbin/sshd -D\""
+        f"ssh-keygen -A && /usr/sbin/sshd"
+        f"\""
     )
 
-    rc, out, err = await run_node_cmd(node_name, setup_cmd, timeout=240)
+    rc, out, err = await run_node_cmd(actual_node_name, setup_cmd, timeout=300)
     if rc != 0:
         return False, {}, err or "Failed to create container"
 
-    node_ip = node.get("ip", "127.0.0.1")
+    _, fetch_out, _ = await run_node_cmd(
+        actual_node_name,
+        f"docker exec {container_name} bash -c \"(neofetch --stdout || screenfetch -N || uname -a) 2>/dev/null | head -n 18\"",
+        timeout=20
+    )
+
     vps_info = {
         "container_name": container_name,
-        "node": node_name,
-        "ip": node_ip,
+        "node": actual_node_name,
+        "ip": node.get("ip", "127.0.0.1"),
         "ssh_port": ssh_port,
         "root_password": root_pass,
         "ram_gb": ram_gb,
         "cores": cores,
         "disk_gb": disk_gb,
-        "os_label": os_info["label"]
+        "os_label": os_info["label"],
+        "fetch_output": fetch_out.strip() or f"OS: {os_info['label']} | RAM: {ram_gb}GB | CPU: {cores} Cores"
     }
     return True, vps_info, ""
 
 
 async def get_sshx_session(node_name: str, container_name: str) -> Tuple[bool, str]:
     cmd = (
+        f"docker start {shlex.quote(container_name)} >/dev/null 2>&1 || true; "
         f"docker exec {shlex.quote(container_name)} bash -c \""
-        f"if ! command -v sshx >/dev/null 2>&1; then curl -sSf https://sshx.io/get | sh >/dev/null 2>&1; fi; "
-        f"pkill -f 'sshx' 2>/dev/null || true; "
-        f"nohup sshx > /tmp/sshx.log 2>&1 & "
-        f"for i in 1 2 3 4 5 6 7 8; do "
-        f"  grep -oE 'https://sshx\\.io/s/[A-Za-z0-9_#-]+' /tmp/sshx.log | head -n 1 && break; "
+        f"export PATH=\\$PATH:/usr/local/bin:/root/.local/bin; "
+        f"if ! command -v sshx >/dev/null 2>&1; then "
+        f"  apt-get update -y >/dev/null 2>&1 && apt-get install -y --no-install-recommends curl ca-certificates >/dev/null 2>&1; "
+        f"  curl -sSf https://sshx.io/get | sh >/dev/null 2>&1; "
+        f"fi; "
+        f"pkill -9 -f 'sshx' 2>/dev/null || true; "
+        f"rm -f /tmp/sshx.log; "
+        f"nohup sshx --quiet > /tmp/sshx.log 2>&1 & "
+        f"sleep 1; "
+        f"if ! pgrep -f 'sshx' >/dev/null 2>&1; then nohup sshx > /tmp/sshx.log 2>&1 & fi; "
+        f"for i in 1 2 3 4 5 6 7 8 9 10; do "
+        f"  sed 's/\\x1b\\[[0-9;]*m//g' /tmp/sshx.log 2>/dev/null | grep -oE 'https://sshx\\.io/s/[A-Za-z0-9_#-]+' | head -n 1 && break; "
         f"  sleep 1; "
         f"done\""
     )
-    rc, out, err = await run_node_cmd(node_name, cmd, timeout=30)
-    match = re.search(r"https://sshx\.io/s/[A-Za-z0-9_#-]+", out)
+    rc, out, err = await run_node_cmd(node_name, cmd, timeout=45)
+    clean_out = re.sub(r"\x1b\[[0-9;]*m", "", out or "")
+    match = re.search(r"https://sshx\.io/s/[A-Za-z0-9_#-]+", clean_out)
     if match:
         return True, match.group(0)
-    return False, err or out or "Failed to generate SSHX link"
+    return False, err or clean_out or "Could not generate SSHX link (check container internet access)"
 
 
 async def get_tmate_session(node_name: str, container_name: str) -> Tuple[bool, str]:
     cmd = (
+        f"docker start {shlex.quote(container_name)} >/dev/null 2>&1 || true; "
         f"docker exec {shlex.quote(container_name)} bash -c "
         f"\"tmate -S /tmp/tmate.sock new-session -d && tmate -S /tmp/tmate.sock wait tmate-ready && "
         f"tmate -S /tmp/tmate.sock display -p '#{{tmate_ssh}}'\""
@@ -182,7 +242,10 @@ async def get_tmate_session(node_name: str, container_name: str) -> Tuple[bool, 
 
 async def reset_container_password(node_name: str, container_name: str) -> Tuple[bool, str]:
     new_pass = f"Frosty@{random.randint(100000, 999999)}"
-    cmd = f"docker exec {shlex.quote(container_name)} bash -c \"echo 'root:{new_pass}' | chpasswd\""
+    cmd = (
+        f"docker start {shlex.quote(container_name)} >/dev/null 2>&1 || true; "
+        f"docker exec {shlex.quote(container_name)} bash -c \"echo 'root:{new_pass}' | chpasswd && (/usr/sbin/sshd 2>/dev/null || true)\""
+    )
     rc, out, err = await run_node_cmd(node_name, cmd, timeout=20)
     return (rc == 0), (new_pass if rc == 0 else (err or "Failed to reset password"))
 
@@ -190,5 +253,8 @@ async def reset_container_password(node_name: str, container_name: str) -> Tuple
 async def manage_container_power(node_name: str, container_name: str, action: str) -> Tuple[bool, str]:
     if action not in ("start", "stop", "restart", "rm -f"):
         return False, "Invalid action"
-    rc, out, err = await run_node_cmd(node_name, f"docker {action} {shlex.quote(container_name)}", timeout=30)
+    cmd = f"docker {action} {shlex.quote(container_name)}"
+    if action in ("start", "restart"):
+        cmd += f" && docker exec {shlex.quote(container_name)} bash -c '/usr/sbin/sshd 2>/dev/null || true'"
+    rc, out, err = await run_node_cmd(node_name, cmd, timeout=30)
     return (rc == 0), (out if rc == 0 else err)
