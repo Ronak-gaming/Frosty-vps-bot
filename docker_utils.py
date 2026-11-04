@@ -26,7 +26,7 @@ def _resolve_node(node_name: str) -> Dict[str, Any]:
     for k, v in nodes.items():
         if k.lower() == (node_name or "").lower():
             return v
-    # Auto-fallback to primary local node if old container references an unconfigured node like cuba32
+    # Auto-fallback to primary local node if old container references an unconfigured node
     for k, v in nodes.items():
         if isinstance(v, dict) and v.get("is_local"):
             return v
@@ -152,11 +152,21 @@ async def create_vps_container(node_name: str, user_id: int, ram_gb: int, cores:
     root_pass = f"Frosty@{random.randint(100000, 999999)}"
     container_name = f"vps-{user_id}-{random.randint(1000, 9999)}"
 
+    # Auto-clamp MTU to 1400, prefer IPv4, and pull with GCR/DaoCloud mirror fallback
     setup_cmd = (
+        f"grep -q '^precedence ::ffff:0:0/96  100' /etc/gai.conf 2>/dev/null || echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf; "
+        f"MAIN_IF=$(ip route 2>/dev/null | awk '/default/ {{print $5; exit}}'); "
+        f"[ -n \"$MAIN_IF\" ] && ip link set dev \"$MAIN_IF\" mtu 1400 2>/dev/null || true; "
+        f"if ! docker image inspect {docker_image} >/dev/null 2>&1; then "
+        f"  docker pull {docker_image} || "
+        f"  (docker pull mirror.gcr.io/library/{docker_image} && docker tag mirror.gcr.io/library/{docker_image} {docker_image}) || "
+        f"  (docker pull docker.m.daocloud.io/library/{docker_image} && docker tag docker.m.daocloud.io/library/{docker_image} {docker_image}); "
+        f"fi && "
         f"HOST_CPUS=$(nproc 2>/dev/null || echo 1); "
         f"REQ_CPUS={cores}; "
         f"if [ \"$REQ_CPUS\" -gt \"$HOST_CPUS\" ]; then USE_CPUS=\"$HOST_CPUS\"; else USE_CPUS=\"$REQ_CPUS\"; fi; "
         f"docker run -d --name {container_name} --hostname {container_name} "
+        f"--dns 1.1.1.1 --dns 8.8.8.8 "
         f"--memory={ram_gb}g --cpus=\"$USE_CPUS\" -p 0.0.0.0:{ssh_port}:22 --restart unless-stopped {docker_image} "
         f"bash -c \"sleep infinity\" && "
         f"docker exec {container_name} bash -c \""
@@ -175,7 +185,7 @@ async def create_vps_container(node_name: str, user_id: int, ram_gb: int, cores:
         f"\""
     )
 
-    rc, out, err = await run_node_cmd(actual_node_name, setup_cmd, timeout=300)
+    rc, out, err = await run_node_cmd(actual_node_name, setup_cmd, timeout=360)
     if rc != 0:
         return False, {}, err or "Failed to create container"
 
