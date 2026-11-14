@@ -40,6 +40,20 @@ The node IP is checked automatically (`SSH_DISPLAY=auto`). On a **private / NAT 
 connect only through the **Web Console** and **SSHX**. Public-IP nodes show SSH as before. Force a mode with
 `SSH_DISPLAY=always` or `never`. VPS created before this update keep their old behaviour for the fetch banner.
 
+## Workers on private IPs / behind NAT ("No route to host")
+The bot connects to workers over SSH, so the **bot host must be able to reach the worker's IP**. `10.x`, `192.168.x`, `172.16-31.x`
+and `100.64.x` addresses only work if both machines are on the same network. If not you get *No route to host* / *timed out*.
+`/node add` now tests the connection first and tells you which of these it is. Two fixes:
+
+1. **Reverse tunnel (no inbound access needed)** — on the **worker** run the installer → Multi-Node Bot → **[4] Private / NAT Network
+   Tools → [1] NAT worker**. The worker dials *out* to the bot host and exposes its SSH on a loopback port there
+   (`ssh -R 127.0.0.1:<port>:127.0.0.1:22`). The bot then manages it as `127.0.0.1:<port>`. A locked-down account
+   (`frostytunnel`, key restricted to that single port, no shell) is created on the bot host automatically.
+   Needs: the bot host's SSH port and bot port (8765) reachable **from the worker**, and `AllowTcpForwarding yes` in the bot host's sshd.
+2. **Tailscale** — installer → **[4] → [2]** on both machines, then pair the worker with its `100.x` address.
+
+Tunnel keys are revoked automatically when you `/node remove` the node. Settings: `TUNNEL_USER`, `TUNNEL_PORT_START/END`.
+
 ## Adding worker nodes
 `/node add name:Node-2 ip:10.0.0.7 password:<root pw>` (needs `sshpass`), or leave password empty after adding the key
 from `/node key` to the worker's `~/.ssh/authorized_keys`. Workers need Docker. Only `authorized_keys` is touched —
