@@ -77,6 +77,11 @@ PAIR_SECRET = _env("PAIR_SECRET")  # empty -> auto-generated into DATA_DIR/pair_
 LOCAL_NODE_NAME = _env("LOCAL_NODE_NAME", "Node-1")
 SERVER_PUBLIC_IP = _env("SERVER_PUBLIC_IP")  # empty -> auto-detect (public, else LAN)
 
+# ── Reverse-tunnel workers (nodes behind NAT / on unreachable private networks) ──
+TUNNEL_USER = _env("TUNNEL_USER", "frostytunnel")
+TUNNEL_HOME = _env("TUNNEL_HOME")  # empty = the real home of TUNNEL_USER (tests may override)
+TUNNEL_PORT_RANGE = (_env_int("TUNNEL_PORT_START", 41000), _env_int("TUNNEL_PORT_END", 41999))
+
 # ── Provisioning ─────────────────────────────────────────────────────────
 MAX_VPS_PER_USER = _env_int("MAX_VPS_PER_USER", 3)
 PORT_RANGE = (_env_int("PORT_RANGE_START", 20000), _env_int("PORT_RANGE_END", 40000))
