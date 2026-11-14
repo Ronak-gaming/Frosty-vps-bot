@@ -23,8 +23,10 @@ from aiohttp import WSMsgType, web
 import storage
 from config import (
     BOT_VERSION, STATIC_DIR, TEMPLATE_PATH, WEB_BIND, WEB_IDLE_TIMEOUT, WEB_MAX_SESSION,
-    WEB_PORT, WEB_TOKEN_TTL, DISCORD_BOT_TOKEN, is_private_ip, resolve_server_ip, web_base_url,
+    WEB_PORT, WEB_TOKEN_TTL, DISCORD_BOT_TOKEN, TUNNEL_USER, is_private_ip, resolve_server_ip, web_base_url,
 )
+import docker_utils as du
+import tunnel
 from docker_utils import console_argv, ensure_ssh_key
 
 TOKENS: Dict[str, Dict[str, Any]] = {}
@@ -249,7 +251,25 @@ async def pair(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
     node_name = str(payload.get("node_name", "Node-2")).strip()[:40] or "Node-2"
     node_ip = str(payload.get("ip", "")).strip()
-    if payload.get("step") == "confirm" and node_ip:
+    step = payload.get("step")
+    if step in ("tunnel_init", "tunnel_confirm"):
+        if not du.NAME_RE.match(node_name):
+            return web.json_response({"ok": False, "error": "Invalid node name"}, status=400)
+        if step == "tunnel_init":
+            try:
+                port = tunnel.allocate_port(node_name)
+                tunnel.authorize(node_name, str(payload.get("tunnel_pubkey", "")), port)
+            except tunnel.TunnelError as e:
+                return web.json_response({"ok": False, "error": str(e)}, status=400)
+            storage.register_node(node_name, "127.0.0.1", port)
+            return web.json_response({"ok": True, "pubkey": ensure_ssh_key(), "tunnel_port": port,
+                                      "tunnel_user": TUNNEL_USER, "node_name": node_name})
+        node = storage.get_node(node_name)
+        if not node:
+            return web.json_response({"ok": False, "error": "Unknown node — run the tunnel setup again"}, status=404)
+        ok, res = await du.pair_remote_node(node_name, node["ip"], int(node["ssh_port"]), "KEY_ONLY")
+        return web.json_response({"ok": ok, "detail": res}, status=200 if ok else 502)
+    if step == "confirm" and node_ip:
         storage.register_node(node_name, node_ip, int(payload.get("ssh_port", 22)))
     info = BOT_INFO()
     return web.json_response({"ok": True, "bot_name": info["name"], "bot_id": info["id"],
