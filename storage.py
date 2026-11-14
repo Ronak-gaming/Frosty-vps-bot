@@ -195,6 +195,12 @@ def remove_node(name: str) -> str:
     if _q("SELECT 1 FROM vps WHERE node=? LIMIT 1", (node["name"],)):
         return "Node still hosts VPS containers. Delete them first."
     _x("DELETE FROM nodes WHERE name=?", (node["name"],))
+    if node["ip"] == "127.0.0.1":  # reverse-tunnel worker: also revoke its tunnel key
+        try:
+            import tunnel
+            tunnel.revoke(node["name"])
+        except Exception:
+            pass
     return ""
 
 
