@@ -88,6 +88,38 @@ async def run(node_name: str, argv: List[str], timeout: int = 60, stdin: Optiona
     return proc.returncode or 0, out.decode(errors="ignore").strip(), err.decode(errors="ignore").strip()
 
 
+# ── connectivity diagnosis ───────────────────────────────────────────────
+OPTIONS_HINT = (
+    "How to fix: (1) put the bot host and the worker on the same network/VPN (e.g. install Tailscale on both and use the "
+    "100.x address), or (2) set the worker up with the installer's 'Private / NAT worker (reverse tunnel)' option — the worker "
+    "dials out to the bot, so no inbound route is needed."
+)
+
+
+async def probe_tcp(ip: str, port: int, timeout: float = 6.0) -> Tuple[bool, str]:
+    """Can the BOT HOST open a TCP connection to ip:port? Returns (ok, human explanation)."""
+    import errno
+    try:
+        _, w = await asyncio.wait_for(asyncio.open_connection(ip, int(port)), timeout)
+        w.close()
+        try:
+            await w.wait_closed()
+        except Exception:
+            pass
+        return True, "reachable"
+    except ConnectionRefusedError:
+        return False, (f"{ip}:{port} refused the connection — the host is reachable, but nothing is listening on that port "
+                       f"(wrong SSH port, or sshd is stopped).")
+    except asyncio.TimeoutError:
+        return False, (f"{ip}:{port} timed out — a firewall/NAT is dropping packets, or {ip} is a private address on a network "
+                       f"the bot host is not connected to. {OPTIONS_HINT}")
+    except OSError as e:
+        if e.errno in (errno.EHOSTUNREACH, errno.ENETUNREACH):
+            return False, (f"No route to {ip} — the bot host has no path to that address (different private network, "
+                           f"wrong IP, or the host firewall is rejecting it). {OPTIONS_HINT}")
+        return False, f"Could not connect to {ip}:{port}: {e.strerror or e}"
+
+
 # ── node pairing / stats ─────────────────────────────────────────────────
 async def pair_remote_node(name: str, ip: str, port: int, secret: str = "") -> Tuple[bool, str]:
     """Install the bot key on a worker. `secret` = root password (needs sshpass on the bot host) or empty if the
@@ -95,6 +127,9 @@ async def pair_remote_node(name: str, ip: str, port: int, secret: str = "") -> T
     pub = ensure_ssh_key()
     if not pub:
         return False, "Could not create the bot SSH key (is openssh-client installed?)"
+    reachable, why = await probe_tcp(ip, int(port))
+    if not reachable:
+        return False, why
     secret = (secret or "").strip()
     if secret and secret.upper() != "KEY_ONLY" and not secret.startswith("ssh-"):
         script = (
